@@ -1,8 +1,6 @@
 """StrictSpecValidator — anti-downgrade guard for SmartBuy Radar v2.0.
 
 Trava A: Spec contract (canonical name + mandatory tokens + forbidden tokens).
-         Built with Gemini when available, always merged with a deterministic heuristic
-         engine so the guard keeps working when the LLM quota is exhausted.
 Trava B: Outlier price floor (< 55% of the median of the exact model).
 Trava C: Semantic double-check of the 10 cheapest survivors.
 """
@@ -14,7 +12,7 @@ import re
 import statistics
 import unicodedata
 from collections import OrderedDict
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 from google import genai
 from google.genai import types
@@ -26,8 +24,6 @@ from app.utils.parsers import extract_json_from_llm
 logger = logging.getLogger(__name__)
 
 PRICE_FLOOR_RATIO = 0.55
-
-# --------------------------------------------------------------------------- normalization
 
 UNITS = ("gb", "tb", "mb", "hz", "ms", "v", "w", "mah", "mp", "pol", "polegadas", "p")
 
@@ -50,8 +46,6 @@ def flat(text: str) -> str:
     return " " + " ".join(tokenize(text)) + " "
 
 
-# --------------------------------------------------------------------------- lexicons
-
 USED_TOKENS = (
     "usado", "usada", "seminovo", "seminova", "recondicionado", "recondicionada", "vitrine",
     "mostruario", "refurbished", "defeito", "defeituoso", "avariado", "sucata", "retirada de pecas",
@@ -59,49 +53,101 @@ USED_TOKENS = (
 )
 
 ACCESSORY_TOKENS = (
-    "capa", "capinha", "pelicula", "case", "estojo", "bolsa", "protetor", "adesivo", "skin",
-    "caixa vazia", "kit acessorios", "avulso", "avulsa", "aluguel", "conta", "gift card",
-    "cartao presente", "suporte", "bateria avulsa", "manual", "carcaca", "grip",
+    "capa", "capinha", "pelicula", "case", "estojo", "bolsa", "protetor de tela", "adesivo", "skin",
+    "caixa vazia", "kit acessorios", "avulso", "avulsa", "aluguel", "conta primaria", "conta secundaria",
+    "gift card", "cartao presente", "suporte vertical", "suporte de parede", "base carregadora",
+    "base de carregamento", "bateria avulsa", "manual", "carcaca", "grip", "tampa lateral", "faceplate",
+    "cooler para", "unidade de disco", "leitor de disco para",
 )
 
-EXTRA_ALWAYS_FORBIDDEN = ("v1", "v2")
-
-# family -> (trigger tokens, mandatory anchor tokens, exclusive variants, forbidden phrases)
+# Family rules only forbid TRUE downgrades or other generations — never standard revisions like PS5 Slim/Digital
 FAMILY_RULES: list[dict[str, Any]] = [
-    {"name": "switch", "triggers": {"switch"}, "anchors": ["switch"],
-     "variants": {"lite", "oled"}, "phrases": ["switch 2"]},
-    {"name": "iphone", "triggers": {"iphone"}, "anchors": ["iphone"],
-     "variants": {"pro", "max", "plus", "mini", "se", "air"}, "phrases": []},
-    {"name": "galaxy", "triggers": {"galaxy"}, "anchors": ["galaxy"],
-     "variants": {"ultra", "plus", "fe", "edge"}, "phrases": []},
-    {"name": "playstation", "triggers": {"ps5", "ps4", "ps3"}, "anchors": [],
-     "variants": {"digital", "slim", "pro"}, "phrases": []},
-    {"name": "xbox", "triggers": {"xbox"}, "anchors": ["xbox"],
-     "variants": {"series", "one"}, "phrases": []},
-    {"name": "macbook", "triggers": {"macbook"}, "anchors": ["macbook"],
-     "variants": {"air", "pro"}, "phrases": []},
-    {"name": "ipad", "triggers": {"ipad"}, "anchors": ["ipad"],
-     "variants": {"air", "pro", "mini"}, "phrases": []},
-    {"name": "airpods", "triggers": {"airpods"}, "anchors": ["airpods"],
-     "variants": {"pro", "max"}, "phrases": []},
-    {"name": "applewatch", "triggers": {"watch"}, "anchors": [],
-     "variants": {"se", "ultra"}, "phrases": []},
-    {"name": "gpu", "triggers": {"rtx", "gtx", "rx"}, "anchors": [],
-     "variants": {"ti", "super", "xt", "xtx"}, "phrases": []},
-    {"name": "kindle", "triggers": {"kindle"}, "anchors": ["kindle"],
-     "variants": {"paperwhite", "oasis", "scribe"}, "phrases": []},
+    {
+        "name": "switch",
+        "triggers": {"switch"},
+        "anchors": ["switch"],
+        # "lite" is a portable-only downgrade; v1/v2/switch 2 are different models when searching OLED
+        "downgrades_Always": {"lite"},
+        "exclusive_variants": {"oled", "lite"},
+        "phrases": ["switch 2", "joy con avulso", "par de joy con", "dock avulsa"],
+    },
+    {
+        "name": "playstation5",
+        "triggers": {"ps5"},
+        "anchors": ["ps5"],
+        # Do NOT forbid "slim" or "digital" on a general PS5 search — those are the standard ~R$ 3.300-4.100 consoles!
+        "downgrades_Always": {"ps4", "ps3"},
+        "exclusive_variants": {"pro"},
+        "phrases": [
+            "controle dualsense", "dualsense wireless", "headset pulse", "camera hd",
+            "tampa do console", "suporte vertical", "base de carregamento", "leitor de disco",
+            "unidade de disco", "playstation portal",
+        ],
+    },
+    {
+        "name": "iphone",
+        "triggers": {"iphone"},
+        "anchors": ["iphone"],
+        "downgrades_Always": set(),
+        "exclusive_variants": {"pro", "max", "plus", "mini", "se", "air"},
+        "phrases": [],
+    },
+    {
+        "name": "galaxy",
+        "triggers": {"galaxy"},
+        "anchors": ["galaxy"],
+        "downgrades_Always": set(),
+        "exclusive_variants": {"ultra", "plus", "fe", "edge"},
+        "phrases": [],
+    },
+    {
+        "name": "xbox",
+        "triggers": {"xbox"},
+        "anchors": ["xbox"],
+        "downgrades_Always": {"one", "360"},
+        "exclusive_variants": set(),
+        "phrases": ["controle sem fio xbox", "controle xbox"],
+    },
+    {
+        "name": "macbook",
+        "triggers": {"macbook"},
+        "anchors": ["macbook"],
+        "downgrades_Always": set(),
+        "exclusive_variants": {"air", "pro"},
+        "phrases": [],
+    },
+    {
+        "name": "ipad",
+        "triggers": {"ipad"},
+        "anchors": ["ipad"],
+        "downgrades_Always": set(),
+        "exclusive_variants": {"air", "pro", "mini"},
+        "phrases": [],
+    },
+    {
+        "name": "airpods",
+        "triggers": {"airpods"},
+        "anchors": ["airpods"],
+        "downgrades_Always": set(),
+        "exclusive_variants": {"pro", "max"},
+        "phrases": [],
+    },
+    {
+        "name": "gpu",
+        "triggers": {"rtx", "gtx", "rx"},
+        "anchors": [],
+        "downgrades_Always": set(),
+        "exclusive_variants": {"ti", "super", "xt", "xtx"},
+        "phrases": [],
+    },
 ]
 
-GENERIC_VARIANTS = {"lite", "mini", "plus", "ultra", "max", "fe", "xl"}
-
-ALL_VARIANT_WORDS: set[str] = set(GENERIC_VARIANTS)
-for _fam in FAMILY_RULES:
-    ALL_VARIANT_WORDS |= set(_fam["variants"])
+ALL_VARIANT_WORDS: set[str] = {"lite", "oled", "pro", "max", "plus", "ultra", "mini", "fe", "ti", "super", "slim"}
 
 FAMILY_ANCHORS = {
     "iphone", "galaxy", "redmi", "poco", "moto", "playstation", "ps", "xbox", "switch", "pixel",
     "note", "edge", "rtx", "gtx", "rx", "ryzen", "macbook", "ipad", "airpods", "watch", "kindle",
-    "echo", "tab", "mi",
+    "echo", "tab", "mi", "monitor", "tv",
 }
 
 NOISE_TOKENS = {
@@ -118,7 +164,15 @@ STOPWORDS = {
 
 CATEGORY_WORDS = {
     "console", "video", "game", "videogame", "aparelho", "smartphone", "celular", "notebook",
-    "monitor", "gamer", "tv", "smart", "tela", "polegadas",
+    "monitor", "gamer", "tv", "smart", "tela", "polegadas", "pol",
+}
+
+# Protected tokens that LLM is NEVER allowed to mark as forbidden unless the user didn't ask for them
+NEVER_FORBID_ON_CONSOLE = {
+    "slim", "digital", "standard", "edicao", "edition", "bundle", "jogo", "jogos",
+    "825gb", "1tb", "2tb", "branco", "preto", "sony", "nintendo", "microsoft", "bivolt",
+    "com leitor", "sem leitor", "midia fisica", "returnal", "ratchet", "spider", "astro",
+    "mario", "wonder", "kart", "zelda",
 }
 
 UNIT_TOKEN_RE = re.compile(r"^\d+(?:\.\d+)?(?:hz|ms|pol|polegadas|w|v|mp|p|mah)$")
@@ -132,10 +186,24 @@ def _token_present(token: str, tokens: set[str], flat_title: str) -> bool:
     t = norm(token).strip()
     if not t:
         return True
+    if t in CATEGORY_WORDS:
+        return True
     if " " in t:
         return f" {' '.join(tokenize(t))} " in flat_title
     if t in tokens:
         return True
+    # Handle screen sizes like "27" matching "27pol", "27''", "27.0", "23.8" for 24
+    if t.isdigit() and len(t) == 2:
+        for tok in tokens:
+            if tok == t or tok.startswith(t) and tok[len(t):] in UNITS:
+                return True
+        if t == "24" and ("23.8" in tokens or "23.8pol" in tokens or "24.5" in tokens):
+            return True
+    # Handle refresh rate like "144hz" matching "144" or "165hz" / "180hz" on generic monitor searches
+    if t.endswith("hz"):
+        num_part = t[:-2]
+        if num_part in tokens:
+            return True
     if t.replace(".", "").isdigit():
         for tok in tokens:
             if tok.startswith(t) and tok[len(t):] in UNITS:
@@ -154,19 +222,25 @@ def _forbidden_hit(token: str, tokens: set[str], flat_title: str) -> bool:
     return t in tokens
 
 
-# --------------------------------------------------------------------------- Trava A
-
-
 def heuristic_contract(query: str, canonical_name: str | None = None) -> SpecContract:
     qt = tokenize(query)
     qset = set(qt)
     qflat = flat(query)
     mandatory: "OrderedDict[str, None]" = OrderedDict()
 
+    # Check if query has a specific alphanumeric model code (e.g. 24g50f, s24, m3)
+    has_specific_model_code = any(
+        re.search(r"[a-z]", t) and re.search(r"\d", t) and len(t) >= 5 and t not in NOISE_TOKENS and not UNIT_TOKEN_RE.match(t) and not CAPACITY_RE.match(t)
+        for t in qt
+    )
+
     for i, t in enumerate(qt):
         if t in NOISE_TOKENS or t in STOPWORDS or t in CATEGORY_WORDS:
             continue
         if UNIT_TOKEN_RE.match(t):
+            # Keep refresh rate (e.g. 144hz) ONLY when user is doing a generic spec search without model code
+            if not has_specific_model_code and t.endswith("hz"):
+                mandatory[t] = None
             continue
         if CAPACITY_RE.match(t):
             mandatory[t] = None
@@ -179,46 +253,52 @@ def heuristic_contract(query: str, canonical_name: str | None = None) -> SpecCon
             continue
         if t.isdigit():
             prev = qt[i - 1] if i > 0 else ""
-            if len(t) >= 3 or prev in FAMILY_ANCHORS:
-                mandatory[t] = None
+            nxt = qt[i + 1] if i + 1 < len(qt) else ""
+            if len(t) >= 3 or prev in FAMILY_ANCHORS or nxt in ("polegadas", "pol", "hz"):
+                if not has_specific_model_code:
+                    mandatory[t] = None
+        elif len(t) >= 3 and t not in CATEGORY_WORDS:
+            # Brand / product line token (e.g. nintendo, switch, aoc, agon, iphone, samsung)
+            mandatory[t] = None
 
     forbidden: "OrderedDict[str, None]" = OrderedDict()
-    for w in USED_SET | ACCESSORY_SET | set(EXTRA_ALWAYS_FORBIDDEN):
+    for w in USED_SET | ACCESSORY_SET:
         if " " in w:
             if w not in qflat:
                 forbidden[w] = None
         elif w not in qset:
             forbidden[w] = None
 
-    matched_family = False
     for fam in FAMILY_RULES:
         if fam["triggers"] & qset:
-            matched_family = True
             for a in fam["anchors"]:
                 mandatory[a] = None
-            for v in sorted(fam["variants"]):
+            for d in sorted(fam["downgrades_Always"]):
+                if d not in qset:
+                    forbidden[d] = None
+            # Only forbid other exclusive_variants if the user explicitly asked for a specific variant,
+            # OR if a variant is a higher/different tier (like "pro" when searching base "ps5" or "iphone 15")
+            for v in sorted(fam["exclusive_variants"]):
                 if v not in qset:
                     forbidden[v] = None
+            if fam["name"] == "switch" and "oled" in qset:
+                forbidden["v1"] = None
+                forbidden["v2"] = None
             for p in fam["phrases"]:
                 if p not in qflat:
                     forbidden[p] = None
             break
-    if not matched_family:
-        for v in sorted(GENERIC_VARIANTS):
-            if v not in qset:
-                forbidden[v] = None
 
-    # Never forbid something the user asked for
     for tok in list(forbidden):
-        if tok in qset or tok in mandatory:
+        if tok in qset or tok in mandatory or tok in NEVER_FORBID_ON_CONSOLE:
             forbidden.pop(tok, None)
 
     if not mandatory:
         meaningful = [
             t for t in qt
-            if t not in STOPWORDS and t not in CATEGORY_WORDS and t not in NOISE_TOKENS and len(t) >= 3
+            if t not in STOPWORDS and t not in NOISE_TOKENS and len(t) >= 2
         ]
-        for t in sorted(meaningful, key=len, reverse=True)[:2]:
+        for t in meaningful[:3]:
             mandatory[t] = None
 
     return SpecContract(
@@ -230,7 +310,7 @@ def heuristic_contract(query: str, canonical_name: str | None = None) -> SpecCon
 
 
 async def build_spec_contract(query: str, canonical_name: str | None = None) -> SpecContract:
-    """Trava A. Gemini decomposes the query; result is merged with the heuristic contract."""
+    """Trava A. Gemini decomposes the query; result is safely merged with the heuristic contract."""
     base = heuristic_contract(query, canonical_name)
     if not settings.gemini_api_key:
         return base
@@ -241,11 +321,11 @@ async def build_spec_contract(query: str, canonical_name: str | None = None) -> 
         "Decomponha em um contrato de especificação. Retorne EXCLUSIVAMENTE JSON:\n"
         '{"canonical_name": "nome exato e completo do produto",\n'
         ' "mandatory_tokens": ["palavras/códigos que OBRIGATORIAMENTE precisam estar no título do anúncio"],\n'
-        ' "forbidden_tokens": ["variações inferiores, gerações antigas, acessórios e condições a descartar"]}\n'
-        "Regras: mandatory_tokens só pode conter termos que o usuário escreveu (ex: para 'Nintendo Switch OLED' => ['oled']; "
-        "para 'iPhone 15 Pro Max 256GB' => ['pro','max','256gb']). forbidden_tokens deve incluir versões diferentes do mesmo "
-        "produto (ex: 'lite' para Switch OLED), 'usado', 'recondicionado', 'defeito', 'caixa vazia', 'película', 'case', 'capa', "
-        "'estojo', 'aluguel', 'conta' e acessórios avulsos. Use minúsculas."
+        ' "forbidden_tokens": ["variações inferiores (ex: lite quando pediu oled), usados e acessórios avulsos"]}\n'
+        "REGRAS CRÍTICAS:\n"
+        "1. NUNCA coloque 'slim', 'digital', 'standard', 'bundle', 'jogo' ou '1tb' em forbidden_tokens quando o usuário buscar 'PlayStation 5' ou 'PS5' (pois o PS5 Slim e PS5 Digital são o console padrão!).\n"
+        "2. NUNCA coloque palavras genéricas como 'console', 'polegadas', 'aparelho' em mandatory_tokens.\n"
+        "3. Use minúsculas."
     )
     try:
         client = genai.Client(api_key=settings.gemini_api_key)
@@ -266,17 +346,17 @@ async def build_spec_contract(query: str, canonical_name: str | None = None) -> 
     mandatory = list(base.mandatory_tokens)
     for tok in parsed.get("mandatory_tokens") or []:
         n = norm(str(tok)).strip()
-        # Only accept tokens grounded in what the user actually typed
-        if n and all(part in qset or any(q.startswith(part) for q in qset) for part in tokenize(n)):
-            if n not in mandatory:
-                mandatory.append(n)
+        if not n or n in CATEGORY_WORDS or n in STOPWORDS or n in NOISE_TOKENS:
+            continue
+        if all(part in qset for part in tokenize(n)) and n not in mandatory:
+            mandatory.append(n)
 
     forbidden = list(base.forbidden_tokens)
     for tok in parsed.get("forbidden_tokens") or []:
         n = norm(str(tok)).strip()
-        if not n or n in mandatory:
+        if not n or n in mandatory or n in NEVER_FORBID_ON_CONSOLE:
             continue
-        if any(part in qset for part in tokenize(n)):
+        if any(part in qset or part in NEVER_FORBID_ON_CONSOLE for part in tokenize(n)):
             continue
         if n not in forbidden:
             forbidden.append(n)
@@ -291,19 +371,16 @@ async def build_spec_contract(query: str, canonical_name: str | None = None) -> 
 
 
 def spec_from_stored(canonical_name: str, mandatory: list[str], forbidden: list[str]) -> SpecContract:
+    fresh = heuristic_contract(canonical_name)
     return SpecContract(
         canonical_name=canonical_name,
-        mandatory_tokens=mandatory,
-        forbidden_tokens=forbidden,
+        mandatory_tokens=fresh.mandatory_tokens,
+        forbidden_tokens=fresh.forbidden_tokens,
         source="memória",
     )
 
 
-# --------------------------------------------------------------------------- spec check
-
-
 def classify_forbidden(token: str) -> tuple[str, str]:
-    """Returns (category, human label) for a forbidden token that matched."""
     t = norm(token)
     if t in USED_SET:
         return "usado", f"Usado/recondicionado ('{t}')"
@@ -313,19 +390,23 @@ def classify_forbidden(token: str) -> tuple[str, str]:
 
 
 def check_title(title: str, spec: SpecContract, query_has_para: bool = False) -> Optional[tuple[str, str]]:
-    """Returns None when the title passes, otherwise (category, label) explaining the block."""
     tokens = set(tokenize(title))
     ft = flat(title)
+    norm_title = norm(title)
 
     for tok in spec.forbidden_tokens:
         if _forbidden_hit(tok, tokens, ft):
             return classify_forbidden(tok)
 
-    # accessory-for pattern: "<something> para Nintendo Switch ..."
+    # Reject standalone game discs ("Jogo PS5 ...", "Game PS5 ...") when searching for a console
+    if "ps5" in spec.mandatory_tokens or "switch" in spec.mandatory_tokens or "xbox" in spec.mandatory_tokens:
+        if re.match(r"^\s*(?:jogo|game|midia fisica|pelicula|capa|case|controle|suporte|base|cabo|headset| bolsa|estojo)\b", norm_title):
+            return "acessório", "Jogo avulso ou acessório"
+
     if not query_has_para:
-        anchor_tokens = [t for t in tokenize(spec.canonical_name) if len(t) >= 4 and t not in STOPWORDS][:2]
+        anchor_tokens = [t for t in tokenize(spec.canonical_name) if len(t) >= 4 and t not in STOPWORDS and t not in CATEGORY_WORDS][:2]
         for a in anchor_tokens:
-            if re.search(rf"\b(?:para|p/|compativel com)\s+(?:o\s+|a\s+)?(?:\w+\s+){{0,2}}{re.escape(a)}\b", norm(title)):
+            if re.search(rf"\b(?:para|p/|compativel com)\s+(?:o\s+|a\s+)?(?:\w+\s+){{0,2}}{re.escape(a)}\b", norm_title):
                 return "acessório", "Acessório 'para <produto>'"
 
     for tok in spec.mandatory_tokens:
@@ -354,14 +435,10 @@ def apply_spec_filter(
     return kept, ordered
 
 
-# --------------------------------------------------------------------------- Trava B
-
-
 def apply_price_floor(
     items: list[dict[str, Any]],
     reference_price: float | None = None,
 ) -> tuple[list[dict[str, Any]], list[BlockedGroup], float | None]:
-    """Drop anything below 55% of the exact-model median."""
     prices = [float(i["price_pix"]) for i in items if i.get("price_pix")]
     if not prices:
         return items, [], None
@@ -388,13 +465,9 @@ def apply_price_floor(
     return kept, ([blocked] if blocked.count else []), floor
 
 
-# --------------------------------------------------------------------------- Trava C
-
-
 async def semantic_double_check(
     spec: SpecContract, offers: list[StoreOffer], top_n: int = 10
 ) -> tuple[list[StoreOffer], list[BlockedGroup], str]:
-    """Ask Gemini Flash to eliminate any of the N cheapest offers that is not the exact requested version."""
     if not offers:
         return offers, [], "sem ofertas para validar"
     ordered = sorted(offers, key=lambda o: o.price_pix)
@@ -407,13 +480,14 @@ async def semantic_double_check(
         for o in top
     ]
     prompt = (
-        "Você é um auditor de catálogo. O usuário quer EXATAMENTE este produto/versão:\n"
+        "Você é um auditor de catálogo. O usuário buscou:\n"
         f"'{spec.canonical_name}' (tokens obrigatórios: {spec.mandatory_tokens}).\n"
-        "Abaixo estão os 10 menores preços encontrados. Elimine qualquer item que NÃO seja estritamente a mesma "
-        "versão/modelo (versão inferior, geração diferente, acessório, bundle de outro produto, usado).\n"
+        "Abaixo estão os menores preços encontrados. Elimine APENAS itens que sejam claramente outro produto, "
+        "versão inferior proibida (ex: Switch Lite quando pediu Switch OLED), acessório avulso, jogo avulso ou usado.\n"
+        "IMPORTANTE: se o usuário buscou 'PlayStation 5' ou 'Console PlayStation 5', modelos 'PS5 Slim', 'PS5 Digital' e bundles com jogos SÃO VÁLIDOS e NÃO devem ser eliminados!\n"
         f"Itens: {json.dumps(listing, ensure_ascii=False)}\n"
         'Responda EXCLUSIVAMENTE JSON: {"rejected": [{"id": "...", "motivo": "..."}]} '
-        "(lista vazia se todos forem o modelo exato)."
+        "(lista vazia se todos forem válidos)."
     )
     try:
         client = genai.Client(api_key=settings.gemini_api_key)
@@ -434,7 +508,7 @@ async def semantic_double_check(
     valid_ids = {o.id for o in top}
     rejected = {k: v for k, v in rejected.items() if k in valid_ids}
     if not rejected:
-        return offers, [], "Gemini confirmou: todos os 10 menores preços são o modelo exato"
+        return offers, [], "Gemini confirmou: ofertas validadas"
 
     group = BlockedGroup(category="verificação IA", label="Eliminado na dupla checagem semântica (Gemini)")
     kept: list[StoreOffer] = []
@@ -445,4 +519,4 @@ async def semantic_double_check(
                 group.examples.append(f"{o.product_title[:70]} — {rejected[o.id][:60]}")
         else:
             kept.append(o)
-    return kept, [group], f"Gemini eliminou {group.count} item(ns) que não eram o modelo exato"
+    return kept, [group], f"Gemini eliminou {group.count} item(ns) divergente(s)"

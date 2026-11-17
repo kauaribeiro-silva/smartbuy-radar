@@ -88,19 +88,30 @@ def _normalize_store(merchant_name: str, fallback_url: str = "") -> tuple[str, s
 
 
 def _compact_search_query(query: str) -> str:
-    """Strip noisy spec tokens (Hz, ms, HDR10, FreeSync, etc.) so store search engines return more matches."""
-    noise = (
-        r"\b(144hz|165hz|180hz|240hz|60hz|75hz|120hz|1ms|0[.,]5ms|5ms|hdr10|hdr|"
-        r"g-sync|gsync|freesync|amd|nvidia|full\s*hd|fhd|1920x1080|hdmi|displayport|"
-        r"nativo|mbr|wled|led|ips|va|tn|preto|branco)\b"
+    """
+    Strip noisy marketing tokens ONLY when a specific alphanumeric model code (like 24G50F)
+    is present. For general searches (like 'Monitor 27 polegadas 144hz' or 'PlayStation 5'),
+    preserve size and refresh rate so stores return matching products.
+    """
+    cleaned = re.sub(r'["”″\']', " ", query)
+    cleaned = re.sub(r"\bpolegadas\b", " ", cleaned, flags=re.IGNORECASE)
+    has_model_code = bool(
+        re.search(
+            r"\b(?:[a-z]+\d+[a-z0-9]{2,}|\d+[a-z]+\d+[a-z0-9]*)\b",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
     )
-    cleaned = re.sub(noise, " ", query, flags=re.IGNORECASE)
-    cleaned = re.sub(r'["”″\']', " ", cleaned)
-    # If a specific model code (like 24G50F) is present, strip standalone 2-digit inch numbers (24, 27)
-    if re.search(r"\b(?:[a-z]+\d+[a-z0-9]{2,}|\d+[a-z]+\d+[a-z0-9]*)\b", cleaned, flags=re.IGNORECASE):
+    if has_model_code:
+        noise = (
+            r"\b(144hz|165hz|180hz|240hz|60hz|75hz|120hz|1ms|0[.,]5ms|5ms|hdr10|hdr|"
+            r"g-sync|gsync|freesync|amd|nvidia|full\s*hd|fhd|1920x1080|hdmi|displayport|"
+            r"nativo|mbr|wled|led|ips|va|tn|preto|branco)\b"
+        )
+        cleaned = re.sub(noise, " ", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\b\d{2}(?:[.,]\d)?\b", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned if len(cleaned) >= 5 else query.strip()
+    return cleaned if len(cleaned) >= 4 else query.strip()
 
 
 def _matches_query_tokens(candidate_title: str, query: str) -> bool:
