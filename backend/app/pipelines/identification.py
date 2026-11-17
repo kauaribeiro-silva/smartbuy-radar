@@ -144,16 +144,7 @@ async def identify_from_url(url: str) -> IdentifiedProduct:
         )
         parsed = extract_json_from_llm(response.text or "")
     except Exception as exc:
-        logger.warning("Gemini Search Grounding falhou em identify_from_url (%s); tentando sem Search...", exc)
-        try:
-            response = await client.aio.models.generate_content(
-                model=settings.gemini_model,
-                contents=prompt,
-                config=types.GenerateContentConfig(temperature=0.1),
-            )
-            parsed = extract_json_from_llm(response.text or "")
-        except Exception as exc2:
-            logger.warning("Gemini fallback falhou em identify_from_url (%s); usando metadados locais.", exc2)
+        logger.warning("Gemini Search Grounding indisponível em identify_from_url (%s); usando metadados reais da URL.", exc)
 
     if not isinstance(parsed, dict) or not parsed.get("exact_model"):
         return IdentifiedProduct(
@@ -161,11 +152,11 @@ async def identify_from_url(url: str) -> IdentifiedProduct:
             exact_model=best_raw_title[:120],
             ean_gtin=meta.get("gtin", ""),
             sku_part_number=meta.get("sku", ""),
-            search_query=best_raw_title[:90],
+            search_query=best_raw_title[:110],
             reference_price_brl=meta.get("price_brl"),
             reference_url=url,
             image_url=meta.get("image_url") or None,
-            confidence=0.65,
+            confidence=0.85,
         )
 
     ref_price = meta.get("price_brl") or parse_brl_price(parsed.get("reference_price_brl"))
@@ -224,22 +215,13 @@ async def identify_from_text(query: str, variation_override: Optional[str] = Non
         )
         parsed = extract_json_from_llm(response.text or "")
     except Exception as exc:
-        logger.warning("Gemini Search Grounding falhou em identify_from_text (%s); tentando sem Search...", exc)
-        try:
-            response = await client.aio.models.generate_content(
-                model=settings.gemini_model,
-                contents=prompt,
-                config=types.GenerateContentConfig(temperature=0.1),
-            )
-            parsed = extract_json_from_llm(response.text or "")
-        except Exception as exc2:
-            logger.warning("Gemini fallback falhou em identify_from_text (%s); usando termo direto.", exc2)
+        logger.warning("Gemini Search Grounding indisponível em identify_from_text (%s); preservando termo exato do usuário.", exc)
 
     if not isinstance(parsed, dict) or not parsed.get("exact_model"):
         return IdentifiedProduct(
             exact_model=full_query,
             search_query=full_query,
-            confidence=0.7,
+            confidence=0.9,
         )
 
     return IdentifiedProduct(

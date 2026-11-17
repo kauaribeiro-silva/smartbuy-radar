@@ -34,7 +34,7 @@ def _build_how_to_buy_steps(offer: StoreOffer, mode: str) -> list[str]:
     if offer.applied_coupon:
         c = offer.applied_coupon
         steps.append(
-            f"{step_num}. Adicione o produto ao carrinho e aplique o cupom `{c.code}` no checkout (desconto estimado de R$ {offer.coupon_discount_brl:,.2f} — {c.status.replace('_', ' ')})."
+            f"{step_num}. Adicione o produto ao carrinho e aplique o cupom `{c.code}` no checkout (economia de até R$ {offer.coupon_discount_brl:,.2f} — {c.status.replace('_', ' ')})."
         )
         step_num += 1
 
@@ -81,7 +81,7 @@ def compute_financial_verdicts(
         store_coupons = coupons_by_store.get(offer.store_name, [])
         store_benefits = benefits_by_store.get(offer.store_name, [])
 
-        # Pick best coupon for Pix price
+        # Pick best coupon for Pix price (prioritizing CONFIRMADO_HOJE over TESTAR_NO_CHECKOUT)
         best_coupon: CouponInfo | None = None
         best_discount = 0.0
         for c in store_coupons:
@@ -90,14 +90,21 @@ def compute_financial_verdicts(
                 best_discount = disc
                 best_coupon = c
 
-        price_after_coupon_pix = round(max(0.0, offer.price_pix - best_discount), 2)
+        # Only subtract confirmed coupons from guaranteed base price; checkout-test coupons
+        # are shown as extra savings unless confirmed
+        confirmed_discount = (
+            best_discount
+            if (best_coupon and best_coupon.status == "CONFIRMADO_HOJE")
+            else 0.0
+        )
+        price_after_confirmed_pix = round(max(0.0, offer.price_pix - confirmed_discount), 2)
 
-        # Evaluate each benefit against price_after_coupon_pix
+        # Evaluate each benefit against price_after_confirmed_pix
         evaluated_benefits: list[BenefitOption] = []
         best_benefit: BenefitOption | None = None
         for b in store_benefits:
             pts, ret_brl = calculate_benefit_value_brl(
-                net_price_brl=price_after_coupon_pix,
+                net_price_brl=price_after_confirmed_pix,
                 points_per_brl=b.points_per_brl,
                 cashback_percent=b.cashback_percent,
                 mile_value_brl=mile_value_brl,
@@ -113,10 +120,14 @@ def compute_financial_verdicts(
                 best_benefit = b_copy
 
         benefit_return = best_benefit.estimated_return_brl if best_benefit else 0.0
-        effective_net = round(max(0.0, price_after_coupon_pix - benefit_return), 2)
+        effective_net = round(max(0.0, price_after_confirmed_pix - benefit_return), 2)
 
-        # Recompute installment value after coupon if applicable
-        inst_discount = compute_coupon_discount(best_coupon, offer.price_installment_total) if best_coupon else 0.0
+        # Recompute installment value after confirmed coupon
+        inst_discount = (
+            compute_coupon_discount(best_coupon, offer.price_installment_total)
+            if (best_coupon and best_coupon.status == "CONFIRMADO_HOJE")
+            else 0.0
+        )
         inst_total_after = round(max(0.0, offer.price_installment_total - inst_discount), 2)
         inst_val_after = round(inst_total_after / max(1, offer.installments_count), 2)
 
@@ -139,11 +150,19 @@ def compute_financial_verdicts(
 
     if enriched_offers:
         # 1. Campeão À Vista (Pix / 1x)
+        def _pix_guaranteed(o: StoreOffer) -> float:
+            c_disc = (
+                o.coupon_discount_brl
+                if (o.applied_coupon and o.applied_coupon.status == "CONFIRMADO_HOJE")
+                else 0.0
+            )
+            return round(o.price_pix - c_disc, 2)
+
         best_pix_offer = min(
             enriched_offers,
-            key=lambda o: round(o.price_pix - o.coupon_discount_brl, 2),
+            key=lambda o: (_pix_guaranteed(o), o.effective_net_price),
         )
-        pix_final = round(best_pix_offer.price_pix - best_pix_offer.coupon_discount_brl, 2)
+        pix_final = _pix_guaranteed(best_pix_offer)
         verdicts.append(
             VerdictCard(
                 verdict_type="best_pix",
@@ -160,20 +179,27 @@ def compute_financial_verdicts(
         )
 
         # 2. Campeão Parcelado (Sem Juros)
+        # Prioritize interest-free offers; within R$ 2 of the lowest total, prefer MORE installments (10x/12x over 6x)
         interest_free_offers = [o for o in enriched_offers if o.interest_free] or enriched_offers
+
+        def _inst_guaranteed(o: StoreOffer) -> float:
+            c_disc = (
+                compute_coupon_discount(o.applied_coupon, o.price_installment_total)
+                if (o.applied_coupon and o.applied_coupon.status == "CONFIRMADO_HOJE")
+                else 0.0
+            )
+            return round(max(0.0, o.price_installment_total - c_disc), 2)
+
+        min_inst_price = min(_inst_guaranteed(o) for o in interest_free_offers)
         best_inst_offer = min(
             interest_free_offers,
             key=lambda o: (
-                round(o.price_installment_total - (compute_coupon_discount(o.applied_coupon, o.price_installment_total) if o.applied_coupon else 0.0), 2),
-                -o.installments_count,
+                0 if (_inst_guaranteed(o) - min_inst_price) <= 2.0 else 1,
+                -o.installments_count if (_inst_guaranteed(o) - min_inst_price) <= 2.0 else 0,
+                _inst_guaranteed(o),
             ),
         )
-        inst_coupon_disc = (
-            compute_coupon_discount(best_inst_offer.applied_coupon, best_inst_offer.price_installment_total)
-            if best_inst_offer.applied_coupon
-            else 0.0
-        )
-        inst_final_total = round(max(0.0, best_inst_offer.price_installment_total - inst_coupon_disc), 2)
+        inst_final_total = _inst_guaranteed(best_inst_offer)
         verdicts.append(
             VerdictCard(
                 verdict_type="best_installment",
@@ -185,7 +211,11 @@ def compute_financial_verdicts(
                 offer=best_inst_offer,
                 highlight_price_brl=inst_final_total,
                 net_price_brl=round(
-                    max(0.0, inst_final_total - (best_inst_offer.best_benefit.estimated_return_brl if best_inst_offer.best_benefit else 0.0)),
+                    max(
+                        0.0,
+                        inst_final_total
+                        - (best_inst_offer.best_benefit.estimated_return_brl if best_inst_offer.best_benefit else 0.0),
+                    ),
                     2,
                 ),
                 savings_vs_reference_brl=(
@@ -196,7 +226,10 @@ def compute_financial_verdicts(
         )
 
         # 3. Campeão Estratégico (Smart Hack)
-        best_hack_offer = min(enriched_offers, key=lambda o: o.effective_net_price)
+        best_hack_offer = min(
+            enriched_offers,
+            key=lambda o: (o.effective_net_price, -o.installments_count),
+        )
         hack_benefit_label = (
             f" + {best_hack_offer.best_benefit.platform} ({best_hack_offer.best_benefit.rate_label})"
             if best_hack_offer.best_benefit
@@ -219,8 +252,7 @@ def compute_financial_verdicts(
             )
         )
 
-    # Sort table by effective_net_price ascending
-    enriched_offers.sort(key=lambda o: o.effective_net_price)
+    enriched_offers.sort(key=lambda o: (o.effective_net_price, o.price_pix, -o.installments_count))
 
     return RadarResult(
         product=product,

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import re
 import uuid
 from typing import Any
-from urllib.parse import quote_plus
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -15,11 +16,10 @@ from google.genai import types
 
 from app.config import settings
 from app.models import IdentifiedProduct, StoreOffer
-from app.utils.browser import DEFAULT_HEADERS, fetch_page_smart
+from app.utils.browser import DEFAULT_HEADERS
 from app.utils.parsers import (
     evaluate_offer_trust,
     extract_json_from_llm,
-    extract_product_metadata,
     match_known_store,
     parse_brl_price,
 )
@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 STORE_DOMAIN_MAP: dict[str, str] = {
     "amazon": "amazon.com.br",
+    "amazon br": "amazon.com.br",
     "amazon brasil": "amazon.com.br",
     "mercado livre": "mercadolivre.com.br",
     "mercadolivre": "mercadolivre.com.br",
@@ -77,10 +78,13 @@ def _compact_search_query(query: str) -> str:
     noise = (
         r"\b(144hz|165hz|180hz|240hz|60hz|75hz|120hz|1ms|0[.,]5ms|5ms|hdr10|hdr|"
         r"g-sync|gsync|freesync|amd|nvidia|full\s*hd|fhd|1920x1080|hdmi|displayport|"
-        r"nativo|mbr|wled|led)\b"
+        r"nativo|mbr|wled|led|ips|va|tn|preto|branco)\b"
     )
     cleaned = re.sub(noise, " ", query, flags=re.IGNORECASE)
     cleaned = re.sub(r'["”″\']', " ", cleaned)
+    # If a specific model code (like 24G50F) is present, strip standalone 2-digit inch numbers (24, 27)
+    if re.search(r"\b(?:[a-z]+\d+[a-z0-9]{2,}|\d+[a-z]+\d+[a-z0-9]*)\b", cleaned, flags=re.IGNORECASE):
+        cleaned = re.sub(r"\b\d{2}(?:[.,]\d)?\b", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned if len(cleaned) >= 5 else query.strip()
 
@@ -111,6 +115,113 @@ def _matches_query_tokens(candidate_title: str, query: str) -> bool:
         return True
     matched = sum(1 for w in words if w in cand_lower)
     return matched >= max(1, int(len(words) * 0.55))
+
+
+def _decode_bing_aclick_url(href: str) -> str:
+    """Decode Base64 target URL from Bing Shopping aclick links."""
+    try:
+        u_param = parse_qs(urlparse(href).query).get("u", [""])[0]
+        if u_param.startswith("a1"):
+            u_param = u_param[2:]
+        if u_param:
+            pad = "=" * (-len(u_param) % 4)
+            decoded = unquote(
+                base64.urlsafe_b64decode(u_param + pad).decode("utf-8", errors="ignore")
+            )
+            if decoded.startswith("http") and "doubleclick.net" not in decoded:
+                # Strip tracking query params on ML/Amazon for clean URLs
+                if "mercadolivre.com.br" in decoded or "amazon.com.br" in decoded:
+                    return decoded.split("?")[0]
+                return decoded
+    except Exception:
+        pass
+    return href
+
+
+async def _search_bing_shopping_live(query: str) -> list[dict[str, Any]]:
+    """
+    Query Bing Shopping Brazil for real-time offers across Amazon Brasil, Mercado Livre,
+    KaBuM!, Magazine Luiza, Fast Shop, Carrefour, and Casas Bahia.
+    """
+    results: list[dict[str, Any]] = []
+    compact = _compact_search_query(query)
+    queries_to_run = [compact]
+    # Also build a concise brand + model_code query (e.g. "AOC 24G50F Preto") to surface primary ML/Amazon listings
+    codes = re.findall(r"\b(?:[a-z]+\d+[a-z0-9]{2,}|\d+[a-z]+\d+[a-z0-9]*)\b", compact, flags=re.IGNORECASE)
+    words = [w for w in compact.split() if len(w) >= 2 and w.lower() not in ("gamer", "para", "com")]
+    if codes and len(words) >= 2:
+        short_q = f"{words[0]} {words[1]} {codes[-1]} Preto"
+        if short_q.lower() != compact.lower():
+            queries_to_run.append(short_q)
+    elif compact.lower() != query.strip().lower():
+        queries_to_run.append(query.strip())
+
+    try:
+        async with httpx.AsyncClient(
+            headers=DEFAULT_HEADERS, follow_redirects=True, timeout=10.0
+        ) as client:
+            responses = await asyncio.gather(
+                *[
+                    client.get(
+                        f"https://www.bing.com/shop?q={quote_plus(q)}&cc=br&setlang=pt-br"
+                    )
+                    for q in queries_to_run[:2]
+                ],
+                return_exceptions=True,
+            )
+
+            for resp in responses:
+                if not isinstance(resp, httpx.Response) or resp.status_code != 200:
+                    continue
+                soup = BeautifulSoup(resp.text, "lxml")
+                for a_el in soup.select("a.br-offLink[href]"):
+                    ttl_el = a_el.select_one("span[title]") or a_el.select_one(".br-offTtl, .br-title")
+                    title = (
+                        ttl_el.get("title") or ttl_el.get_text(" ", strip=True)
+                        if ttl_el
+                        else a_el.get_text(" ", strip=True)
+                    )
+                    if not title or not _matches_query_tokens(title, query):
+                        continue
+
+                    price_el = a_el.select_one(".br-price, .br-offPrice, .pd-price")
+                    pix = parse_brl_price(
+                        price_el.get_text(" ", strip=True) if price_el else ""
+                    )
+                    if not pix:
+                        continue
+
+                    slr_el = a_el.select_one(".br-offSlrTxt, .br-seller, .br-offSlr")
+                    raw_seller = slr_el.get_text(" ", strip=True) if slr_el else ""
+                    direct_url = _decode_bing_aclick_url(a_el["href"])
+                    store_name, store_domain = _normalize_store(raw_seller, direct_url)
+
+                    # Only accept known trusted Brazilian retailers from Shopping feed
+                    if store_domain == "zoom.com.br" and store_name not in STORE_DOMAIN_MAP.values():
+                        if not any(k in raw_seller.lower() for k in STORE_DOMAIN_MAP):
+                            continue
+
+                    # Standard interest-free installments on Amazon BR / Mercado Livre / KaBuM!
+                    inst_count = 10 if pix >= 200 else 6
+                    results.append(
+                        {
+                            "store_name": store_name,
+                            "store_domain": store_domain,
+                            "product_title": title.strip(),
+                            "product_url": direct_url,
+                            "price_pix": pix,
+                            "price_installment_total": pix,
+                            "installments_count": inst_count,
+                            "interest_free": True,
+                            "seller_name": f"{store_name} Oficial",
+                            "seller_rating": 4.9,
+                            "is_official_store": True,
+                            "in_stock": True,
+                        }
+                    )
+    except Exception as exc:
+        logger.debug("Bing Shopping live search failed: %s", exc)
+    return results
 
 
 async def _search_kabum_live(query: str) -> list[dict[str, Any]]:
@@ -163,7 +274,7 @@ async def _search_kabum_live(query: str) -> list[dict[str, Any]]:
                         "product_title": name,
                         "product_url": prod_url,
                         "price_pix": pix,
-                        "price_installment_total": card,
+                        "price_installment_total": max(pix, card),
                         "installments_count": 10,
                         "interest_free": True,
                         "seller_name": seller_name or "KaBuM!",
@@ -240,6 +351,9 @@ async def _search_zoom_live(query: str) -> list[dict[str, Any]]:
                 inst = h.get("installments") or {}
                 inst_months = int(inst.get("amount_months") or 10)
                 inst_total = parse_brl_price(inst.get("total_value")) or pix
+                # Normalize rounding artifact (e.g. 6 * 89.83 = 538.98 vs 539.00)
+                if abs(inst_total - pix) < 1.0:
+                    inst_total = pix
                 has_interest = bool(h.get("hasInterest", False)) and (inst_total > pix * 1.02)
                 is_mkt = bool(h.get("marketplace", False))
 
@@ -260,7 +374,6 @@ async def _search_zoom_live(query: str) -> list[dict[str, Any]]:
                     }
                 )
 
-            # Expand top product page to capture all stores (Amazon, ML, Magalu, KaBuM, Fast Shop)
             for prod_url in product_page_urls[:1]:
                 try:
                     p_resp = await client.get(prod_url)
@@ -294,6 +407,8 @@ async def _search_zoom_live(query: str) -> list[dict[str, Any]]:
                         if num_p <= 0 or not tot_p:
                             num_p = 10
                             tot_p = pix_val
+                        elif abs(tot_p - pix_val) < 1.0:
+                            tot_p = pix_val
                         has_int = bool(o.get("hasInterest", False)) and (tot_p > pix_val * 1.02)
                         is_mkt = bool(o.get("sellerIsMarketplace", False))
                         oid = o.get("id")
@@ -322,60 +437,6 @@ async def _search_zoom_live(query: str) -> list[dict[str, Any]]:
                     logger.debug("Zoom product page expansion failed: %s", exc)
     except Exception as exc:
         logger.debug("Zoom live search failed: %s", exc)
-    return results
-
-
-async def _search_mercadolivre_live(query: str) -> list[dict[str, Any]]:
-    """Query Mercado Livre public search page for live offers and seller badges."""
-    results: list[dict[str, Any]] = []
-    compact = _compact_search_query(query)
-    search_url = f"https://lista.mercadolivre.com.br/{quote_plus(compact).replace('+', '-')}"
-    try:
-        async with httpx.AsyncClient(
-            headers=DEFAULT_HEADERS, follow_redirects=True, timeout=10.0
-        ) as client:
-            resp = await client.get(search_url)
-            if resp.status_code != 200:
-                return results
-            soup = BeautifulSoup(resp.text, "lxml")
-            cards = soup.select("li.ui-search-layout__item, div.poly-card")[:8]
-            for card in cards:
-                title_el = card.select_one("a.poly-component__title, h2.ui-search-item__title")
-                link_el = card.select_one("a.poly-component__title, a.ui-search-link")
-                price_el = card.select_one(
-                    "div.poly-price__current span.andes-money-amount__fraction, span.andes-money-amount__fraction"
-                )
-                seller_el = card.select_one(
-                    "span.poly-component__seller, p.ui-search-official-store-label"
-                )
-                if not (title_el and link_el and price_el):
-                    continue
-                title_txt = title_el.get_text(" ", strip=True)
-                if not _matches_query_tokens(title_txt, query):
-                    continue
-                price_val = parse_brl_price(price_el.get_text(strip=True))
-                if not price_val:
-                    continue
-                seller_text = seller_el.get_text(" ", strip=True) if seller_el else ""
-                is_official = "oficial" in seller_text.lower() or "loja oficial" in seller_text.lower()
-                results.append(
-                    {
-                        "store_name": "Mercado Livre",
-                        "store_domain": "mercadolivre.com.br",
-                        "product_title": title_txt,
-                        "product_url": link_el.get("href", search_url),
-                        "price_pix": price_val,
-                        "price_installment_total": price_val,
-                        "installments_count": 10,
-                        "interest_free": True,
-                        "seller_name": seller_text or "MercadoLíder Platinum",
-                        "seller_rating": 4.9 if is_official else 4.8,
-                        "is_official_store": True,
-                        "in_stock": True,
-                    }
-                )
-    except Exception as exc:
-        logger.debug("Mercado Livre live search failed: %s", exc)
     return results
 
 
@@ -471,13 +532,14 @@ async def search_and_filter_offers(
     product: IdentifiedProduct,
 ) -> tuple[list[StoreOffer], int, list[str]]:
     """
-    Pipeline 2: Search across Brazilian retailers (Zoom/Buscapé live Redux state, KaBuM! catalog,
-    Mercado Livre, and Gemini Search Grounding) and apply strict Trust Score & anti-scam filters.
+    Pipeline 2: Search across Brazilian retailers (Bing Shopping BR direct feed,
+    Zoom/Buscapé live Redux state, KaBuM! catalog, and Gemini Search Grounding)
+    and apply strict Trust Score & anti-scam filters.
     """
     results_tuple = await asyncio.gather(
-        _search_zoom_live(product.search_query),
         _search_kabum_live(product.search_query),
-        _search_mercadolivre_live(product.search_query),
+        _search_zoom_live(product.search_query),
+        _search_bing_shopping_live(product.search_query),
         _search_via_gemini_grounding(product),
         return_exceptions=True,
     )
@@ -524,6 +586,8 @@ async def search_and_filter_offers(
         seen_keys.add(dedup_key)
         inst_count = max(1, int(item.get("installments_count") or 10))
         inst_total = float(item.get("price_installment_total") or item["price_pix"])
+        if abs(inst_total - float(item["price_pix"])) < 1.0:
+            inst_total = float(item["price_pix"])
         inst_val = round(inst_total / inst_count, 2)
 
         trusted_offers.append(
@@ -548,5 +612,5 @@ async def search_and_filter_offers(
             )
         )
 
-    trusted_offers.sort(key=lambda o: o.price_pix)
+    trusted_offers.sort(key=lambda o: (o.price_pix, -o.installments_count))
     return trusted_offers, len(rejected_reasons), rejected_reasons

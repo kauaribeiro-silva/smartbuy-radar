@@ -42,6 +42,8 @@ REFURBISHED_KEYWORDS = (
     "refurbished",
     "open box",
     "openbox",
+    "caixa aberta",
+    "embalagem aberta",
     "avaria",
     "peça de reposição",
     "para retirada de peças",
