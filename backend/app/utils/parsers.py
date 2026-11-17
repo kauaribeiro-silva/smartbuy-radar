@@ -76,7 +76,10 @@ def parse_brl_price(text: str | float | int | None) -> Optional[float]:
         return val if val > 0 else None
 
     cleaned = str(text).strip()
-    match = re.search(r"(\d{1,3}(?:\.\d{3})*,\d{2}|\d+(?:[.,]\d{1,2})?)", cleaned)
+    match = re.search(
+        r"(\d{1,3}(?:\.\d{3})*,\d{2}|\d{1,3}(?:\.\d{3})+(?![\d,])|\d+(?:[.,]\d{1,2})?)",
+        cleaned,
+    )
     if not match:
         return None
     raw = match.group(1)
@@ -84,6 +87,9 @@ def parse_brl_price(text: str | float | int | None) -> Optional[float]:
         raw = raw.replace(".", "").replace(",", ".")
     elif "," in raw:
         raw = raw.replace(",", ".")
+    elif re.fullmatch(r"\d{1,3}(?:\.\d{3})+", raw):
+        # Brazilian thousands separator without decimals, e.g. "1.655" -> 1655
+        raw = raw.replace(".", "")
     try:
         val = float(raw)
         return round(val, 2) if val > 0 else None

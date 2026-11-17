@@ -206,8 +206,15 @@ export function ComparisonTable({
               return (
                 <tr key={offer.id} className="transition hover:bg-gray-900/50">
                   <td className="px-4 py-3.5">
-                    <div className="font-semibold text-white">
-                      {offer.store_name}
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="font-semibold text-white">
+                        {offer.store_name}
+                      </span>
+                      {offer.source && (
+                        <span className="rounded bg-gray-800 px-1.5 py-0.5 font-mono text-[10px] text-cyan-300 border border-gray-700">
+                          {offer.source}
+                        </span>
+                      )}
                     </div>
                     <div className="mt-0.5 text-[11px] text-gray-400 line-clamp-1 max-w-[230px]">
                       {offer.product_title}

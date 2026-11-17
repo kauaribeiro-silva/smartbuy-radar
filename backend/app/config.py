@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.5-flash-lite"
     app_access_password: str = ""
+    smartbuy_db_path: str = ""
     default_mile_value_brl: float = 30.0
     headless_browser: bool = True
     scrape_timeout_seconds: int = 25

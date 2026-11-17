@@ -1,6 +1,12 @@
 from app.models import BenefitOption, CouponInfo, IdentifiedProduct, StoreOffer
 from app.pipelines.coupon_hunter import compute_coupon_discount
 from app.pipelines.financial_engine import compute_financial_verdicts
+from app.pipelines.recommendations import compute_timing_verdict
+from app.pipelines.spec_validator import (
+    apply_price_floor,
+    apply_spec_filter,
+    heuristic_contract,
+)
 from app.utils.parsers import (
     evaluate_offer_trust,
     extract_product_metadata,
@@ -204,3 +210,61 @@ def test_compute_financial_verdicts():
     assert verdict_map["best_smart_hack"].offer.store_name == "Amazon Brasil"
     assert verdict_map["best_smart_hack"].highlight_price_brl == 3570.0
     assert len(verdict_map["best_smart_hack"].how_to_buy_steps) >= 3
+
+
+def test_strict_spec_validator_switch_oled_vs_lite():
+    spec = heuristic_contract("Nintendo Switch OLED")
+    assert "oled" in spec.mandatory_tokens
+    assert "lite" in spec.forbidden_tokens
+
+    raw = [
+        {"product_title": "Console Nintendo Switch OLED 64GB Branco", "price_pix": 1999.0},
+        {"product_title": "Console Nintendo Switch Lite Turquesa", "price_pix": 1199.0},
+        {"product_title": "Estojo Case Capa Protetora para Nintendo Switch OLED", "price_pix": 89.0},
+        {"product_title": "Console Nintendo Switch V2 32GB Neon", "price_pix": 1699.0},
+    ]
+    kept, blocked = apply_spec_filter(raw, spec)
+    assert len(kept) == 1
+    assert kept[0]["product_title"] == "Console Nintendo Switch OLED 64GB Branco"
+    assert sum(g.count for g in blocked) == 3
+
+
+def test_outlier_price_floor_55_percent():
+    items = [
+        {"product_title": "Nintendo Switch OLED", "price_pix": 1950.0},
+        {"product_title": "Nintendo Switch OLED", "price_pix": 2000.0},
+        {"product_title": "Nintendo Switch OLED", "price_pix": 2050.0},
+        {"product_title": "Nintendo Switch OLED golpe/peça", "price_pix": 850.0},
+    ]
+    kept, blocked, floor = apply_price_floor(items)
+    assert floor == 1086.25  # 55% of median 1975.0
+    assert len(kept) == 3
+    assert len(blocked) == 1
+    assert blocked[0].count == 1
+
+
+def test_timing_verdict_levels():
+    offer = StoreOffer(
+        id="o1",
+        store_name="Shopee Oficial",
+        store_domain="shopee.com.br",
+        seller_name="Shopee Oficial",
+        is_official_store=True,
+        trust_score=96,
+        product_title="Console Nintendo Switch OLED",
+        product_url="https://shopee.com.br/item",
+        price_pix=1655.0,
+        price_installment_total=1655.0,
+        installments_count=10,
+        installment_value=165.5,
+        interest_free=True,
+        effective_net_price=1620.0,
+        source="Pelando",
+    )
+    v_green = compute_timing_verdict([offer], [{"price_pix": 1850.0}], lowest_seen_db=1800.0)
+    assert v_green.level == "green"
+
+    v_red = compute_timing_verdict([offer], [{"price_pix": 1350.0}], lowest_seen_db=1350.0)
+    assert v_red.level == "red"
+    assert v_red.watch_suggested is True
+

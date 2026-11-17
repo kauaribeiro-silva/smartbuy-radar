@@ -1,17 +1,23 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Barcode, PackageCheck, AlertOctagon, Lock } from "lucide-react";
 import { SearchHero, PaymentFilterMode } from "@/components/SearchHero";
+import { StartupPromoRadar } from "@/components/StartupPromoRadar";
 import { LiveAgentLogs } from "@/components/LiveAgentLogs";
+import { SpecGuardBanner } from "@/components/SpecGuardBanner";
 import { VerdictCards } from "@/components/VerdictCards";
 import { HowToBuyGuide } from "@/components/HowToBuyGuide";
+import { BuyingIntelligence } from "@/components/BuyingIntelligence";
 import { ComparisonTable } from "@/components/ComparisonTable";
 import {
   IdentifiedProduct,
+  RadarAlert,
   RadarResult,
+  Recommendation,
   SSEEvent,
+  TrackedProduct,
   VerdictCard,
   formatBRL,
 } from "@/types/radar";
@@ -29,6 +35,66 @@ export default function HomePage() {
     null
   );
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  // Persistent Memory & Startup Promo Radar state
+  const [trackedItems, setTrackedItems] = useState<TrackedProduct[]>([]);
+  const [radarAlerts, setRadarAlerts] = useState<RadarAlert[]>([]);
+  const [startupRecs, setStartupRecs] = useState<Recommendation[]>([]);
+
+  const loadStartupRadar = useCallback(async () => {
+    try {
+      const res = await fetch("/api/memory/radar", { cache: "no-store" });
+      if (res.status === 401) {
+        router.push("/login");
+        return;
+      }
+      if (!res.ok) return;
+      const data = await res.json();
+      setTrackedItems(data.items || []);
+      setRadarAlerts(data.alerts || []);
+      setStartupRecs(data.recommendations || []);
+    } catch {
+      // Non-fatal on initial load
+    }
+  }, [router]);
+
+  useEffect(() => {
+    loadStartupRadar();
+  }, [loadStartupRadar]);
+
+  const handleRefreshItem = async (id: number) => {
+    const res = await fetch(`/api/memory/refresh/${id}`, { method: "POST" });
+    if (res.ok) {
+      await loadStartupRadar();
+    }
+  };
+
+  const handleUpdateTargetPrice = async (id: number, target: number | null) => {
+    await fetch(`/api/memory/products/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(
+        target !== null
+          ? { target_price: target, is_watching: true }
+          : { clear_target_price: true }
+      ),
+    });
+    await loadStartupRadar();
+  };
+
+  const handleDismissAlert = async (id: number) => {
+    await fetch(`/api/memory/products/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ dismiss_alert: true }),
+    });
+    await loadStartupRadar();
+  };
+
+  const handleDeleteItem = async (id: number) => {
+    await fetch(`/api/memory/products/${id}`, { method: "DELETE" });
+    await loadStartupRadar();
+  };
 
   const handlePaymentFilterChange = (mode: PaymentFilterMode) => {
     setPaymentFilter(mode);
@@ -147,6 +213,7 @@ export default function HomePage() {
                 res.verdicts[0] ||
                 null;
               setSelectedVerdict(chosen);
+              loadStartupRadar();
             } else if (evt.status === "error") {
               setErrorMsg(evt.message);
             }
@@ -188,6 +255,7 @@ export default function HomePage() {
             <span>Bloquear</span>
           </button>
         </div>
+
         <SearchHero
           isSearching={isSearching}
           mileValueBrl={mileValueBrl}
@@ -199,6 +267,18 @@ export default function HomePage() {
           onDismissAmbiguity={() => setAmbiguityProduct(null)}
         />
 
+        <StartupPromoRadar
+          items={trackedItems}
+          alerts={radarAlerts}
+          onTriggerSearch={(q) =>
+            handleSearch({ inputText: q, imageFile: null })
+          }
+          onRefreshItem={handleRefreshItem}
+          onUpdateTargetPrice={handleUpdateTargetPrice}
+          onDismissAlert={handleDismissAlert}
+          onDeleteItem={handleDeleteItem}
+        />
+
         {errorMsg && (
           <div className="mx-auto mb-6 flex max-w-4xl items-center gap-3 rounded-xl border border-red-500/40 bg-red-500/10 p-4 text-sm text-red-300">
             <AlertOctagon className="h-5 w-5 shrink-0 text-red-400" />
@@ -208,9 +288,20 @@ export default function HomePage() {
 
         <LiveAgentLogs logs={logs} isSearching={isSearching} />
 
+        {/* Show Startup Recommendations when no search is active yet */}
+        {!result && !isSearching && startupRecs.length > 0 && (
+          <BuyingIntelligence
+            timing={null}
+            recommendations={startupRecs}
+            onTriggerSearch={(q) =>
+              handleSearch({ inputText: q, imageFile: null })
+            }
+          />
+        )}
+
         {result && (
           <>
-            <section className="mx-auto mb-6 flex max-w-6xl flex-wrap items-center justify-between gap-4 rounded-2xl border border-gray-800 bg-radar-surface/90 p-4">
+            <section className="mx-auto mb-4 flex max-w-6xl flex-wrap items-center justify-between gap-4 rounded-2xl border border-gray-800 bg-radar-surface/90 p-4">
               <div className="flex items-center gap-3">
                 <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-cyan-500/15 text-cyan-400">
                   <PackageCheck className="h-6 w-6" />
@@ -218,7 +309,7 @@ export default function HomePage() {
                 <div>
                   <div className="flex flex-wrap items-center gap-2">
                     <h2 className="text-base font-bold text-white sm:text-lg">
-                      {result.product.exact_model}
+                      {result.spec?.canonical_name || result.product.exact_model}
                     </h2>
                     {result.product.brand && (
                       <span className="rounded-md bg-gray-800 px-2 py-0.5 text-[11px] font-medium text-gray-300">
@@ -257,6 +348,14 @@ export default function HomePage() {
               )}
             </section>
 
+            <SpecGuardBanner
+              spec={result.spec}
+              blockedGroups={result.blocked_groups}
+              channels={result.channels}
+              priceFloorBrl={result.price_floor_brl}
+              semanticCheck={result.semantic_check}
+            />
+
             <VerdictCards
               verdicts={result.verdicts}
               selectedVerdictType={selectedVerdict?.verdict_type || ""}
@@ -264,6 +363,14 @@ export default function HomePage() {
             />
 
             <HowToBuyGuide verdict={selectedVerdict} />
+
+            <BuyingIntelligence
+              timing={result.timing}
+              recommendations={result.recommendations}
+              onTriggerSearch={(q) =>
+                handleSearch({ inputText: q, imageFile: null })
+              }
+            />
 
             <ComparisonTable
               offers={result.offers}

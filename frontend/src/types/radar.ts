@@ -65,6 +65,11 @@ export interface StoreOffer {
   effective_net_price: number;
   all_coupons: CouponInfo[];
   all_benefits: BenefitOption[];
+  source?: string;
+  deal_age_hours?: number | null;
+  deal_note?: string;
+  embedded_coupon_code?: string;
+  page_coupon?: CouponInfo | null;
 }
 
 export interface VerdictCard {
@@ -78,6 +83,53 @@ export interface VerdictCard {
   how_to_buy_steps: string[];
 }
 
+export interface SpecContract {
+  canonical_name: string;
+  mandatory_tokens: string[];
+  forbidden_tokens: string[];
+  source: string;
+}
+
+export interface BlockedGroup {
+  category: string;
+  label: string;
+  count: number;
+  examples: string[];
+}
+
+export interface ChannelStatus {
+  name: string;
+  status: "ok" | "vazio" | "bloqueado" | "indisponivel";
+  count: number;
+  detail: string;
+}
+
+export interface TimingVerdict {
+  level: "green" | "yellow" | "red";
+  label: string;
+  headline: string;
+  reasons: string[];
+  current_price: number | null;
+  lowest_seen: number | null;
+  median_seen: number | null;
+  history_points: number;
+  watch_suggested: boolean;
+}
+
+export interface Recommendation {
+  kind: "alternative" | "complement";
+  title: string;
+  query: string;
+  reason: string;
+  store: string;
+  price_brl: number | null;
+  url: string;
+  installments: string;
+  delta_vs_main_brl: number | null;
+  delta_pct: number | null;
+  near_price: boolean;
+}
+
 export interface RadarResult {
   product: IdentifiedProduct;
   reference_price_brl: number | null;
@@ -86,7 +138,69 @@ export interface RadarResult {
   verdicts: VerdictCard[];
   rejected_offers_count: number;
   rejected_reasons: string[];
+  spec?: SpecContract | null;
+  blocked_groups?: BlockedGroup[];
+  channels?: ChannelStatus[];
+  price_floor_brl?: number | null;
+  semantic_check?: string;
+  timing?: TimingVerdict | null;
+  recommendations?: Recommendation[];
+  tracked_product_id?: number | null;
   generated_at: string;
+}
+
+export interface PriceHistoryPoint {
+  id: number;
+  product_id: number;
+  price_pix: number | null;
+  price_installments: number | null;
+  effective_price: number | null;
+  store: string;
+  recorded_at: string;
+}
+
+export interface TrackedProduct {
+  id: number;
+  product_key: string;
+  canonical_name: string;
+  search_query: string;
+  mandatory_tokens: string[];
+  forbidden_tokens: string[];
+  first_seen_price: number | null;
+  lowest_seen_price: number | null;
+  last_checked_price: number | null;
+  best_store: string;
+  best_url: string;
+  active_coupon: string;
+  last_checked_at: string | null;
+  is_watching: boolean;
+  target_price: number | null;
+  alert_kind: string;
+  alert_message: string;
+  alert_amount: number | null;
+  alert_at: string | null;
+  alert_dismissed: boolean;
+  category: string;
+  brand: string;
+  image_url: string;
+  history?: PriceHistoryPoint[];
+}
+
+export interface RadarAlert {
+  product_id: number;
+  kind: string;
+  message: string;
+  amount: number | null;
+  at: string | null;
+  canonical_name: string;
+  best_url: string;
+  best_store: string;
+}
+
+export interface StartupRadarData {
+  items: TrackedProduct[];
+  alerts: RadarAlert[];
+  recommendations: Recommendation[];
 }
 
 export interface SSEEvent {
@@ -97,6 +211,7 @@ export interface SSEEvent {
   progress_pct: number;
   data?: {
     product?: IdentifiedProduct;
+    spec?: SpecContract;
     result?: RadarResult;
   } | null;
 }

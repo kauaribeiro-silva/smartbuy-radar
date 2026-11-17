@@ -74,6 +74,62 @@ class StoreOffer(BaseModel):
     effective_net_price: float = 0.0
     all_coupons: list[CouponInfo] = Field(default_factory=list)
     all_benefits: list[BenefitOption] = Field(default_factory=list)
+    # v2.0 — provenance & community signals
+    source: str = ""
+    deal_age_hours: float | None = None
+    deal_note: str = ""
+    embedded_coupon_code: str = ""
+    page_coupon: CouponInfo | None = None
+
+
+class SpecContract(BaseModel):
+    """Trava A — contrato de especificação: o que um anúncio PRECISA ter / NÃO pode ter."""
+
+    canonical_name: str
+    mandatory_tokens: list[str] = Field(default_factory=list)
+    forbidden_tokens: list[str] = Field(default_factory=list)
+    source: str = "heuristic"
+
+
+class BlockedGroup(BaseModel):
+    category: str
+    label: str
+    count: int = 0
+    examples: list[str] = Field(default_factory=list)
+
+
+class ChannelStatus(BaseModel):
+    name: str
+    status: Literal["ok", "vazio", "bloqueado", "indisponivel"] = "ok"
+    count: int = 0
+    detail: str = ""
+
+
+class TimingVerdict(BaseModel):
+    level: Literal["green", "yellow", "red"]
+    label: str
+    headline: str
+    reasons: list[str] = Field(default_factory=list)
+    current_price: float | None = None
+    lowest_seen: float | None = None
+    median_seen: float | None = None
+    history_points: int = 0
+    watch_suggested: bool = False
+
+
+class Recommendation(BaseModel):
+    kind: Literal["alternative", "complement"]
+    title: str
+    query: str
+    reason: str
+    store: str = ""
+    price_brl: float | None = None
+    url: str = ""
+    installments: str = ""
+    delta_vs_main_brl: float | None = None
+    delta_pct: float | None = None
+    near_price: bool = False
+    community_deal: dict[str, Any] | None = None
 
 
 class VerdictCard(BaseModel):
@@ -95,6 +151,15 @@ class RadarResult(BaseModel):
     verdicts: list[VerdictCard] = Field(default_factory=list)
     rejected_offers_count: int = 0
     rejected_reasons: list[str] = Field(default_factory=list)
+    # v2.0
+    spec: SpecContract | None = None
+    blocked_groups: list[BlockedGroup] = Field(default_factory=list)
+    channels: list[ChannelStatus] = Field(default_factory=list)
+    price_floor_brl: float | None = None
+    semantic_check: str = ""
+    timing: TimingVerdict | None = None
+    recommendations: list[Recommendation] = Field(default_factory=list)
+    tracked_product_id: int | None = None
     generated_at: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )

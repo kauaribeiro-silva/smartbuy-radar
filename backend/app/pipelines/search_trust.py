@@ -15,7 +15,21 @@ from google import genai
 from google.genai import types
 
 from app.config import settings
-from app.models import IdentifiedProduct, StoreOffer
+from app.models import (
+    BlockedGroup,
+    ChannelStatus,
+    CouponInfo,
+    IdentifiedProduct,
+    SpecContract,
+    StoreOffer,
+)
+from app.pipelines.marketplace_hunter import hunt_pelando_live, hunt_promobit_live
+from app.pipelines.spec_validator import (
+    apply_price_floor,
+    apply_spec_filter,
+    heuristic_contract,
+    semantic_double_check,
+)
 from app.utils.browser import DEFAULT_HEADERS
 from app.utils.parsers import (
     evaluate_offer_trust,
@@ -181,7 +195,7 @@ async def _search_bing_shopping_live(query: str) -> list[dict[str, Any]]:
                         if ttl_el
                         else a_el.get_text(" ", strip=True)
                     )
-                    if not title or not _matches_query_tokens(title, query):
+                    if not title:
                         continue
 
                     price_el = a_el.select_one(".br-price, .br-offPrice, .pd-price")
@@ -253,7 +267,7 @@ async def _search_kabum_live(query: str) -> list[dict[str, Any]]:
                 if not isinstance(it, dict) or not it.get("available", True):
                     continue
                 name = str(it.get("name") or "").strip()
-                if not name or not _matches_query_tokens(name, query):
+                if not name:
                     continue
                 pix = parse_brl_price(it.get("priceWithDiscount") or it.get("price"))
                 card = parse_brl_price(it.get("price")) or pix
@@ -322,7 +336,7 @@ async def _search_zoom_live(query: str) -> list[dict[str, Any]]:
                 if not isinstance(h, dict):
                     continue
                 name = str(h.get("name") or "").strip()
-                if not name or not _matches_query_tokens(name, query):
+                if not name:
                     continue
 
                 hit_type = h.get("type")
@@ -528,38 +542,117 @@ async def _search_via_gemini_grounding(product: IdentifiedProduct) -> list[dict[
     return cleaned
 
 
-async def search_and_filter_offers(
+async def search_and_filter_offers_v2(
     product: IdentifiedProduct,
-) -> tuple[list[StoreOffer], int, list[str]]:
+    spec: SpecContract | None = None,
+) -> dict[str, Any]:
     """
-    Pipeline 2: Search across Brazilian retailers (Bing Shopping BR direct feed,
-    Zoom/Buscapé live Redux state, KaBuM! catalog, and Gemini Search Grounding)
-    and apply strict Trust Score & anti-scam filters.
+    Pipeline 2 (v2.0): Multi-channel deep search (KaBuM!, Zoom/Buscapé, Bing Shopping BR,
+    Pelando 72h, Promobit API, Gemini Grounding) + StrictSpecValidator (Travas A, B, C).
     """
-    results_tuple = await asyncio.gather(
-        _search_kabum_live(product.search_query),
-        _search_zoom_live(product.search_query),
-        _search_bing_shopping_live(product.search_query),
-        _search_via_gemini_grounding(product),
+    active_spec = spec or heuristic_contract(product.search_query, product.exact_model)
+
+    kabum_task = _search_kabum_live(product.search_query)
+    zoom_task = _search_zoom_live(product.search_query)
+    bing_task = _search_bing_shopping_live(product.search_query)
+    pelando_task = hunt_pelando_live(product.search_query, spec=active_spec)
+    promobit_task = hunt_promobit_live(product.search_query, spec=None)
+    gemini_task = _search_via_gemini_grounding(product)
+
+    (
+        kabum_res,
+        zoom_res,
+        bing_res,
+        pelando_res,
+        promobit_res,
+        gemini_res,
+    ) = await asyncio.gather(
+        kabum_task,
+        zoom_task,
+        bing_task,
+        pelando_task,
+        promobit_task,
+        gemini_task,
         return_exceptions=True,
     )
 
     raw_offers: list[dict[str, Any]] = []
-    for res in results_tuple:
-        if isinstance(res, list):
-            raw_offers.extend(res)
+    channels: list[ChannelStatus] = []
+    community_coupons: list[CouponInfo] = []
+
+    if isinstance(kabum_res, list):
+        for o in kabum_res:
+            o.setdefault("source", "KaBuM! Direto")
+        raw_offers.extend(kabum_res)
+        channels.append(
+            ChannelStatus(
+                name="KaBuM! Catálogo",
+                status="ok" if kabum_res else "vazio",
+                count=len(kabum_res),
+            )
+        )
+    if isinstance(zoom_res, list):
+        for o in zoom_res:
+            o.setdefault("source", "Zoom / Buscapé")
+        raw_offers.extend(zoom_res)
+        channels.append(
+            ChannelStatus(
+                name="Zoom / Buscapé",
+                status="ok" if zoom_res else "vazio",
+                count=len(zoom_res),
+            )
+        )
+    if isinstance(bing_res, list):
+        for o in bing_res:
+            o.setdefault("source", "Shopping SERP (Amazon/ML)")
+        raw_offers.extend(bing_res)
+        channels.append(
+            ChannelStatus(
+                name="Shopping SERP (Amazon/ML)",
+                status="ok" if bing_res else "vazio",
+                count=len(bing_res),
+            )
+        )
+    if isinstance(pelando_res, tuple):
+        pel_offers, pel_status = pelando_res
+        raw_offers.extend(pel_offers)
+        channels.append(pel_status)
+    if isinstance(promobit_res, tuple):
+        pro_offers, pro_coupons, pro_status = promobit_res
+        raw_offers.extend(pro_offers)
+        community_coupons.extend(pro_coupons)
+        channels.append(pro_status)
+    if isinstance(gemini_res, list) and gemini_res:
+        for o in gemini_res:
+            o.setdefault("source", "Gemini Grounding")
+        raw_offers.extend(gemini_res)
+        channels.append(
+            ChannelStatus(name="Gemini Grounding", status="ok", count=len(gemini_res))
+        )
+
+    # ── TRAVA A: Spec Contract Filter (mandatory & forbidden tokens) ──────────
+    spec_kept, blocked_spec_groups = apply_spec_filter(raw_offers, active_spec)
+
+    # ── TRAVA B: Outlier Price Floor (< 55% of exact-model median) ────────────
+    floor_kept, blocked_floor_groups, price_floor_brl = apply_price_floor(
+        spec_kept, reference_price=product.reference_price_brl
+    )
+
+    blocked_groups: list[BlockedGroup] = blocked_spec_groups + blocked_floor_groups
+    rejected_reasons: list[str] = [
+        f"{g.label}: {g.count} anúncio(s) bloqueado(s)" for g in blocked_groups
+    ]
 
     ref_price = product.reference_price_brl
-    if not ref_price and raw_offers:
-        prices = sorted(o["price_pix"] for o in raw_offers if o.get("price_pix"))
+    if not ref_price and floor_kept:
+        prices = sorted(o["price_pix"] for o in floor_kept if o.get("price_pix"))
         if prices:
             ref_price = prices[len(prices) // 2]
 
     trusted_offers: list[StoreOffer] = []
-    rejected_reasons: list[str] = []
     seen_keys: set[str] = set()
 
-    for item in raw_offers:
+    for item in floor_kept:
         if not item.get("in_stock", True):
             rejected_reasons.append(f"{item['store_name']}: Produto sem estoque.")
             continue
@@ -570,7 +663,7 @@ async def search_and_filter_offers(
 
         passed, score, reason = evaluate_offer_trust(
             product_title=item["product_title"],
-            target_query=product.exact_model,
+            target_query=active_spec.canonical_name,
             store_name=item["store_name"],
             seller_name=item.get("seller_name", ""),
             seller_rating=item.get("seller_rating"),
@@ -580,7 +673,9 @@ async def search_and_filter_offers(
         )
 
         if not passed:
-            rejected_reasons.append(f"{item['store_name']} ({item.get('seller_name') or '3P'}): {reason}")
+            rejected_reasons.append(
+                f"{item['store_name']} ({item.get('seller_name') or '3P'}): {reason}"
+            )
             continue
 
         seen_keys.add(dedup_key)
@@ -609,8 +704,41 @@ async def search_and_filter_offers(
                 installment_value=inst_val,
                 interest_free=bool(item.get("interest_free", True)),
                 effective_net_price=round(float(item["price_pix"]), 2),
+                source=str(item.get("source") or ""),
+                deal_age_hours=item.get("deal_age_hours"),
+                deal_note=str(item.get("deal_note") or ""),
+                embedded_coupon_code=str(item.get("embedded_coupon_code") or ""),
+                page_coupon=item.get("page_coupon"),
             )
         )
 
-    trusted_offers.sort(key=lambda o: (o.price_pix, -o.installments_count))
-    return trusted_offers, len(rejected_reasons), rejected_reasons
+    # ── TRAVA C: Semantic Double-Check on Top 10 Cheapest ────────────────────
+    checked_offers, sem_groups, sem_msg = await semantic_double_check(
+        active_spec, trusted_offers
+    )
+    if sem_groups:
+        blocked_groups.extend(sem_groups)
+        for g in sem_groups:
+            rejected_reasons.append(f"{g.label}: {g.count} item(ns)")
+
+    checked_offers.sort(key=lambda o: (o.price_pix, -o.installments_count))
+    total_blocked = sum(g.count for g in blocked_groups)
+
+    return {
+        "offers": checked_offers,
+        "rejected_count": max(total_blocked, len(rejected_reasons)),
+        "rejected_reasons": rejected_reasons,
+        "blocked_groups": blocked_groups,
+        "channels": channels,
+        "price_floor_brl": price_floor_brl,
+        "semantic_check": sem_msg,
+        "community_coupons": community_coupons,
+    }
+
+
+async def search_and_filter_offers(
+    product: IdentifiedProduct,
+) -> tuple[list[StoreOffer], int, list[str]]:
+    """Backward-compatible wrapper returning (trusted_offers, rejected_count, rejected_reasons)."""
+    res = await search_and_filter_offers_v2(product)
+    return res["offers"], res["rejected_count"], res["rejected_reasons"]
