@@ -2,7 +2,7 @@
 
 import React, { useState } from "react";
 import { Barcode, PackageCheck, AlertOctagon } from "lucide-react";
-import { SearchHero } from "@/components/SearchHero";
+import { SearchHero, PaymentFilterMode } from "@/components/SearchHero";
 import { LiveAgentLogs } from "@/components/LiveAgentLogs";
 import { VerdictCards } from "@/components/VerdictCards";
 import { HowToBuyGuide } from "@/components/HowToBuyGuide";
@@ -21,6 +21,7 @@ const API_BASE =
 export default function HomePage() {
   const [isSearching, setIsSearching] = useState(false);
   const [mileValueBrl, setMileValueBrl] = useState(30);
+  const [paymentFilter, setPaymentFilter] = useState<PaymentFilterMode>("all");
   const [logs, setLogs] = useState<SSEEvent[]>([]);
   const [result, setResult] = useState<RadarResult | null>(null);
   const [ambiguityProduct, setAmbiguityProduct] =
@@ -29,6 +30,25 @@ export default function HomePage() {
     null
   );
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const handlePaymentFilterChange = (mode: PaymentFilterMode) => {
+    setPaymentFilter(mode);
+    if (!result) return;
+    if (mode === "pix") {
+      const v = result.verdicts.find((c) => c.verdict_type === "best_pix");
+      if (v) setSelectedVerdict(v);
+    } else if (mode === "installment") {
+      const v = result.verdicts.find(
+        (c) => c.verdict_type === "best_installment"
+      );
+      if (v) setSelectedVerdict(v);
+    } else {
+      const v =
+        result.verdicts.find((c) => c.verdict_type === "best_smart_hack") ||
+        result.verdicts[0];
+      if (v) setSelectedVerdict(v);
+    }
+  };
 
   const handleSearch = async ({
     inputText,
@@ -87,10 +107,12 @@ export default function HomePage() {
       while (true) {
         const { done, value } = await reader.read();
         if (value) {
-          buffer += decoder.decode(value, { stream: !done }).replace(/\r\n/g, "\n");
+          buffer += decoder
+            .decode(value, { stream: !done })
+            .replace(/\r\n/g, "\n");
         }
         const rawEvents = buffer.split("\n\n");
-        buffer = done ? "" : (rawEvents.pop() || "");
+        buffer = done ? "" : rawEvents.pop() || "";
 
         for (const chunk of rawEvents) {
           if (!chunk.trim()) continue;
@@ -110,13 +132,17 @@ export default function HomePage() {
             } else if (evt.status === "result" && evt.data?.result) {
               const res = evt.data.result;
               setResult(res);
-              const smartHack =
-                res.verdicts.find(
-                  (v) => v.verdict_type === "best_smart_hack"
-                ) ||
+              const preferredType =
+                paymentFilter === "pix"
+                  ? "best_pix"
+                  : paymentFilter === "installment"
+                  ? "best_installment"
+                  : "best_smart_hack";
+              const chosen =
+                res.verdicts.find((v) => v.verdict_type === preferredType) ||
                 res.verdicts[0] ||
                 null;
-              setSelectedVerdict(smartHack);
+              setSelectedVerdict(chosen);
             } else if (evt.status === "error") {
               setErrorMsg(evt.message);
             }
@@ -145,6 +171,8 @@ export default function HomePage() {
           isSearching={isSearching}
           mileValueBrl={mileValueBrl}
           onMileValueChange={setMileValueBrl}
+          paymentFilter={paymentFilter}
+          onPaymentFilterChange={handlePaymentFilterChange}
           onSearch={handleSearch}
           ambiguityProduct={ambiguityProduct}
           onDismissAmbiguity={() => setAmbiguityProduct(null)}
@@ -161,7 +189,6 @@ export default function HomePage() {
 
         {result && (
           <>
-            {/* Identified Product Banner */}
             <section className="mx-auto mb-6 flex max-w-6xl flex-wrap items-center justify-between gap-4 rounded-2xl border border-gray-800 bg-radar-surface/90 p-4">
               <div className="flex items-center gap-3">
                 <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-cyan-500/15 text-cyan-400">
@@ -221,6 +248,8 @@ export default function HomePage() {
               offers={result.offers}
               rejectedCount={result.rejected_offers_count}
               rejectedReasons={result.rejected_reasons}
+              paymentFilter={paymentFilter}
+              onPaymentFilterChange={handlePaymentFilterChange}
             />
           </>
         )}

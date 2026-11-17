@@ -9,13 +9,20 @@ import {
   Upload,
   X,
   AlertCircle,
+  Zap,
+  CreditCard,
+  Layers,
 } from "lucide-react";
 import { IdentifiedProduct } from "@/types/radar";
+
+export type PaymentFilterMode = "all" | "pix" | "installment";
 
 interface SearchHeroProps {
   isSearching: boolean;
   mileValueBrl: number;
   onMileValueChange: (val: number) => void;
+  paymentFilter: PaymentFilterMode;
+  onPaymentFilterChange: (mode: PaymentFilterMode) => void;
   onSearch: (payload: {
     inputText: string;
     imageFile: File | null;
@@ -30,6 +37,8 @@ export function SearchHero({
   isSearching,
   mileValueBrl,
   onMileValueChange,
+  paymentFilter,
+  onPaymentFilterChange,
   onSearch,
   ambiguityProduct,
   onDismissAmbiguity,
@@ -93,7 +102,8 @@ export function SearchHero({
           SmartBuy Radar
         </h1>
         <p className="mt-2.5 text-sm text-gray-400 sm:text-base">
-          Cole o <span className="text-gray-200 font-medium">link do produto</span> ou{" "}
+          Cole o <span className="text-gray-200 font-medium">link do produto</span>, digite o{" "}
+          <span className="text-gray-200 font-medium">modelo</span> ou{" "}
           <span className="text-gray-200 font-medium">cole/envie uma imagem (Ctrl+V)</span>.
           Nós encontramos o menor preço real com cupom ativo, pontos e cashback.
         </p>
@@ -191,27 +201,72 @@ export function SearchHero({
           </div>
         </div>
 
-        <div className="mt-3 flex flex-wrap items-center justify-between gap-3 px-1 text-xs text-gray-500">
-          <div className="flex items-center gap-1.5">
-            <Upload className="h-3.5 w-3.5 text-gray-500" />
-            <span>Arraste uma imagem ou pressione Ctrl+V em qualquer lugar da barra</span>
+        {/* Filter Bar: Payment Mode + Mile Value */}
+        <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-gray-800/70 pt-3 px-1 text-xs">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="mr-1 text-gray-400 font-medium">Modalidade:</span>
+            <button
+              type="button"
+              onClick={() => onPaymentFilterChange("all")}
+              className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 font-medium transition ${
+                paymentFilter === "all"
+                  ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
+                  : "bg-gray-900 text-gray-400 border border-gray-800 hover:text-gray-200"
+              }`}
+            >
+              <Layers className="h-3.5 w-3.5" />
+              <span>Todas</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => onPaymentFilterChange("pix")}
+              className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 font-medium transition ${
+                paymentFilter === "pix"
+                  ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40"
+                  : "bg-gray-900 text-gray-400 border border-gray-800 hover:text-gray-200"
+              }`}
+            >
+              <Zap className="h-3.5 w-3.5" />
+              <span>À Vista (Pix / 1x)</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => onPaymentFilterChange("installment")}
+              className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 font-medium transition ${
+                paymentFilter === "installment"
+                  ? "bg-indigo-500/20 text-indigo-300 border border-indigo-500/40"
+                  : "bg-gray-900 text-gray-400 border border-gray-800 hover:text-gray-200"
+              }`}
+            >
+              <CreditCard className="h-3.5 w-3.5" />
+              <span>Parcelado (Cartão)</span>
+            </button>
           </div>
 
-          <label className="flex items-center gap-2 text-gray-400">
-            <span>Valor do Milheiro (1.000 pts):</span>
-            <div className="flex items-center rounded-lg border border-gray-800 bg-gray-900 px-2 py-1">
-              <span className="mr-1 text-gray-500">R$</span>
-              <input
-                type="number"
-                min={10}
-                max={80}
-                step={1}
-                value={mileValueBrl}
-                onChange={(e) => onMileValueChange(Number(e.target.value) || 30)}
-                className="w-12 bg-transparent font-mono text-xs text-emerald-400 outline-none"
-              />
-            </div>
-          </label>
+          <div className="flex items-center gap-3">
+            <span className="hidden lg:inline-flex items-center gap-1 text-gray-500">
+              <Upload className="h-3.5 w-3.5" />
+              Ctrl+V para colar print
+            </span>
+            <label
+              className="flex items-center gap-2 text-gray-400"
+              title="Valor estimado de cada 1.000 pontos Livelo/Esfera em R$ para calcular seu desconto real"
+            >
+              <span>Valor do Milheiro (1.000 pts):</span>
+              <div className="flex items-center rounded-lg border border-gray-800 bg-gray-900 px-2 py-1">
+                <span className="mr-1 text-gray-500">R$</span>
+                <input
+                  type="number"
+                  min={10}
+                  max={80}
+                  step={1}
+                  value={mileValueBrl}
+                  onChange={(e) => onMileValueChange(Number(e.target.value) || 30)}
+                  className="w-12 bg-transparent font-mono text-xs text-emerald-400 outline-none"
+                />
+              </div>
+            </label>
+          </div>
         </div>
       </form>
 
