@@ -1,7 +1,8 @@
 "use client";
 
 import React, { useState } from "react";
-import { Barcode, PackageCheck, AlertOctagon } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { Barcode, PackageCheck, AlertOctagon, Lock } from "lucide-react";
 import { SearchHero, PaymentFilterMode } from "@/components/SearchHero";
 import { LiveAgentLogs } from "@/components/LiveAgentLogs";
 import { VerdictCards } from "@/components/VerdictCards";
@@ -15,10 +16,8 @@ import {
   formatBRL,
 } from "@/types/radar";
 
-const API_BASE =
-  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-
 export default function HomePage() {
+  const router = useRouter();
   const [isSearching, setIsSearching] = useState(false);
   const [mileValueBrl, setMileValueBrl] = useState(30);
   const [paymentFilter, setPaymentFilter] = useState<PaymentFilterMode>("all");
@@ -90,10 +89,15 @@ export default function HomePage() {
     formData.append("mile_value_brl", String(mileValueBrl));
 
     try {
-      const response = await fetch(`${API_BASE}/api/radar/stream`, {
+      const response = await fetch("/api/radar", {
         method: "POST",
         body: formData,
       });
+
+      if (response.status === 401) {
+        router.push("/login");
+        return;
+      }
 
       if (!response.ok || !response.body) {
         const errText = await response.text();
@@ -164,9 +168,26 @@ export default function HomePage() {
     }
   };
 
+  const handleLock = async () => {
+    await fetch("/api/auth", { method: "DELETE" });
+    router.push("/login");
+    router.refresh();
+  };
+
   return (
     <main className="min-h-screen bg-radar-grid px-4 pb-16 sm:px-6 lg:px-8">
       <div className="mx-auto max-w-6xl">
+        <div className="flex justify-end pt-4">
+          <button
+            type="button"
+            onClick={handleLock}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-gray-800 bg-radar-surface/80 px-3 py-1.5 text-xs text-gray-400 transition hover:border-gray-700 hover:text-white"
+            title="Bloquear sessão"
+          >
+            <Lock className="h-3.5 w-3.5 text-emerald-400" />
+            <span>Bloquear</span>
+          </button>
+        </div>
         <SearchHero
           isSearching={isSearching}
           mileValueBrl={mileValueBrl}

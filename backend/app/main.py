@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
@@ -48,10 +49,19 @@ async def radar_stream(
     mile_value_brl: float = Form(default=settings.default_mile_value_brl),
     skip_ambiguity_prompt: bool = Form(default=False),
     image: Optional[UploadFile] = File(default=None),
+    x_radar_key: Optional[str] = Header(default=None),
 ) -> EventSourceResponse:
     """
     Unified SSE streaming endpoint accepting a product URL, text query, or uploaded/pasted image.
     """
+    if settings.app_access_password:
+        if not x_radar_key or not hmac.compare_digest(
+            x_radar_key, settings.app_access_password
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="Acesso não autorizado.",
+            )
     clean_url = url.strip() if url and url.strip() else None
     clean_query = query.strip() if query and query.strip() else None
     clean_variation = (
