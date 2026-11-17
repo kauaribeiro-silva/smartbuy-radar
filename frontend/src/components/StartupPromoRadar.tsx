@@ -213,7 +213,9 @@ export function StartupPromoRadar({
                         {savingTargetId === item.id ? "..." : "Salvar"}
                       </button>
                       {item.is_watching && (
-                        <Bell className="ml-auto h-3.5 w-3.5 text-emerald-400" title="Monitoramento ativo" />
+                        <span className="ml-auto" title="Monitoramento ativo">
+                          <Bell className="h-3.5 w-3.5 text-emerald-400" />
+                        </span>
                       )}
                     </div>
 
