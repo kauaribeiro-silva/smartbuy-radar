@@ -86,13 +86,14 @@ export default function HomePage() {
 
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
+        if (value) {
+          buffer += decoder.decode(value, { stream: !done }).replace(/\r\n/g, "\n");
+        }
         const rawEvents = buffer.split("\n\n");
-        buffer = rawEvents.pop() || "";
+        buffer = done ? "" : (rawEvents.pop() || "");
 
         for (const chunk of rawEvents) {
+          if (!chunk.trim()) continue;
           const dataLines = chunk
             .split("\n")
             .filter((line) => line.startsWith("data:"))
@@ -123,6 +124,8 @@ export default function HomePage() {
             // Ignore malformed keepalive chunks
           }
         }
+
+        if (done) break;
       }
     } catch (err) {
       const message =
