@@ -72,16 +72,20 @@ async def analyze_points_and_cashback(
         "]"
     )
 
-    response = await client.aio.models.generate_content(
-        model=settings.gemini_model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            tools=[types.Tool(google_search=types.GoogleSearch())],
-            temperature=0.1,
-        ),
-    )
+    parsed = None
+    try:
+        response = await client.aio.models.generate_content(
+            model=settings.gemini_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                temperature=0.1,
+            ),
+        )
+        parsed = extract_json_from_llm(response.text or "")
+    except Exception as exc:
+        logger.warning("Gemini Search falhou em analyze_points_and_cashback (%s); prosseguindo sem taxas via IA.", exc)
 
-    parsed = extract_json_from_llm(response.text or "")
     benefits_by_store: dict[str, list[BenefitOption]] = {s: [] for s in unique_stores}
 
     if not isinstance(parsed, list):

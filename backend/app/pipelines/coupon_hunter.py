@@ -118,16 +118,20 @@ async def hunt_live_coupons(
         "]"
     )
 
-    response = await client.aio.models.generate_content(
-        model=settings.gemini_model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            tools=[types.Tool(google_search=types.GoogleSearch())],
-            temperature=0.1,
-        ),
-    )
+    parsed = None
+    try:
+        response = await client.aio.models.generate_content(
+            model=settings.gemini_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                temperature=0.1,
+            ),
+        )
+        parsed = extract_json_from_llm(response.text or "")
+    except Exception as exc:
+        logger.warning("Gemini Search falhou em hunt_live_coupons (%s); prosseguindo sem cupons via IA.", exc)
 
-    parsed = extract_json_from_llm(response.text or "")
     coupons_by_store: dict[str, list[CouponInfo]] = {s: [] for s in unique_stores}
 
     if not isinstance(parsed, list):

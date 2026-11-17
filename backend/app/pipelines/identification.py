@@ -83,24 +83,39 @@ async def identify_from_image(
     )
 
 
+def _title_from_url_slug(url: str) -> str:
+    """Extract a human-readable product title from a Brazilian e-commerce URL slug."""
+    from urllib.parse import urlparse
+    import re
+
+    path = urlparse(url).path.strip("/")
+    segments = [s for s in path.split("/") if s and s not in ("p", "dp", "produto", "produtos")]
+    # Pick the longest descriptive slug segment
+    best = max(segments, key=len, default="")
+    # Strip trailing Mercado Livre / Amazon IDs like MLB12345 or B0XYZ
+    best = re.sub(r"\b(MLB\d+|B0[A-Z0-9]{8})\b", "", best, flags=re.IGNORECASE)
+    cleaned = re.sub(r"[-_+]+", " ", best).strip()
+    return cleaned[:120] if len(cleaned) >= 4 else url
+
+
 async def identify_from_url(url: str) -> IdentifiedProduct:
     """Pipeline 1B: Extract JSON-LD, og:title, EAN/SKU and reference price from product URL."""
     html = await fetch_page_smart(url)
     meta = extract_product_metadata(html, url) if html else {"url": url, "title": ""}
+    slug_title = _title_from_url_slug(url)
+    best_raw_title = meta.get("title") or slug_title
 
     client = _get_client()
     prompt = (
         "Você é um especialista em normalização de catálogo de e-commerce brasileiro.\n"
         "Abaixo estão os metadados extraídos da URL de referência do usuário:\n"
         f"- URL: {url}\n"
-        f"- Título extraído: {meta.get('title', '')}\n"
+        f"- Título extraído: {best_raw_title}\n"
         f"- Marca extraída: {meta.get('brand', '')}\n"
         f"- SKU extraído: {meta.get('sku', '')}\n"
         f"- EAN/GTIN extraído: {meta.get('gtin', '')}\n"
         f"- Preço extraído: {meta.get('price_brl')}\n"
         f"- Descrição: {str(meta.get('description', ''))[:400]}\n\n"
-        "Se os metadados estiverem incompletos (por exemplo, página bloqueou scraping), "
-        "use o Google Search para identificar exatamente qual produto é essa URL.\n"
         "Retorne EXCLUSIVAMENTE um JSON válido com:\n"
         "{\n"
         '  "brand": "Marca",\n'
@@ -117,28 +132,40 @@ async def identify_from_url(url: str) -> IdentifiedProduct:
         "}"
     )
 
-    response = await client.aio.models.generate_content(
-        model=settings.gemini_model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            tools=[types.Tool(google_search=types.GoogleSearch())],
-            temperature=0.1,
-        ),
-    )
+    parsed = None
+    try:
+        response = await client.aio.models.generate_content(
+            model=settings.gemini_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                temperature=0.1,
+            ),
+        )
+        parsed = extract_json_from_llm(response.text or "")
+    except Exception as exc:
+        logger.warning("Gemini Search Grounding falhou em identify_from_url (%s); tentando sem Search...", exc)
+        try:
+            response = await client.aio.models.generate_content(
+                model=settings.gemini_model,
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.1),
+            )
+            parsed = extract_json_from_llm(response.text or "")
+        except Exception as exc2:
+            logger.warning("Gemini fallback falhou em identify_from_url (%s); usando metadados locais.", exc2)
 
-    parsed = extract_json_from_llm(response.text or "")
     if not isinstance(parsed, dict) or not parsed.get("exact_model"):
-        fallback_title = meta.get("title") or url
         return IdentifiedProduct(
             brand=meta.get("brand", ""),
-            exact_model=fallback_title[:120],
+            exact_model=best_raw_title[:120],
             ean_gtin=meta.get("gtin", ""),
             sku_part_number=meta.get("sku", ""),
-            search_query=fallback_title[:100],
+            search_query=best_raw_title[:90],
             reference_price_brl=meta.get("price_brl"),
             reference_url=url,
             image_url=meta.get("image_url") or None,
-            confidence=0.6,
+            confidence=0.65,
         )
 
     ref_price = meta.get("price_brl") or parse_brl_price(parsed.get("reference_price_brl"))
@@ -185,16 +212,29 @@ async def identify_from_text(query: str, variation_override: Optional[str] = Non
         "}"
     )
 
-    response = await client.aio.models.generate_content(
-        model=settings.gemini_model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            tools=[types.Tool(google_search=types.GoogleSearch())],
-            temperature=0.1,
-        ),
-    )
+    parsed = None
+    try:
+        response = await client.aio.models.generate_content(
+            model=settings.gemini_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                temperature=0.1,
+            ),
+        )
+        parsed = extract_json_from_llm(response.text or "")
+    except Exception as exc:
+        logger.warning("Gemini Search Grounding falhou em identify_from_text (%s); tentando sem Search...", exc)
+        try:
+            response = await client.aio.models.generate_content(
+                model=settings.gemini_model,
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.1),
+            )
+            parsed = extract_json_from_llm(response.text or "")
+        except Exception as exc2:
+            logger.warning("Gemini fallback falhou em identify_from_text (%s); usando termo direto.", exc2)
 
-    parsed = extract_json_from_llm(response.text or "")
     if not isinstance(parsed, dict) or not parsed.get("exact_model"):
         return IdentifiedProduct(
             exact_model=full_query,
