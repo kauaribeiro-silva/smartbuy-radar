@@ -12,6 +12,7 @@ import {
   Zap,
   CreditCard,
   Layers,
+  Info,
 } from "lucide-react";
 import { StoreOffer, formatBRL } from "@/types/radar";
 import { PaymentFilterMode } from "@/components/SearchHero";
@@ -22,6 +23,8 @@ interface ComparisonTableProps {
   rejectedReasons: string[];
   paymentFilter: PaymentFilterMode;
   onPaymentFilterChange: (mode: PaymentFilterMode) => void;
+  simulateCoupons: boolean;
+  onSimulateCouponsChange: (val: boolean) => void;
 }
 
 export function ComparisonTable({
@@ -30,6 +33,8 @@ export function ComparisonTable({
   rejectedReasons,
   paymentFilter,
   onPaymentFilterChange,
+  simulateCoupons,
+  onSimulateCouponsChange,
 }: ComparisonTableProps) {
   const [showRejected, setShowRejected] = useState(false);
   const [onlyInterestFree, setOnlyInterestFree] = useState(false);
@@ -41,20 +46,34 @@ export function ComparisonTable({
     }
     list.sort((a, b) => {
       if (paymentFilter === "pix") {
-        const aPix = a.price_pix - a.coupon_discount_brl;
-        const bPix = b.price_pix - b.coupon_discount_brl;
+        const aPix = simulateCoupons
+          ? a.price_pix_with_coupon ?? a.price_pix
+          : a.price_pix;
+        const bPix = simulateCoupons
+          ? b.price_pix_with_coupon ?? b.price_pix
+          : b.price_pix;
         return aPix - bPix;
       }
       if (paymentFilter === "installment") {
-        const aInst = a.price_installment_total - a.coupon_discount_brl;
-        const bInst = b.price_installment_total - b.coupon_discount_brl;
+        const aInst =
+          a.price_installment_total -
+          (simulateCoupons ? a.coupon_discount_brl : 0);
+        const bInst =
+          b.price_installment_total -
+          (simulateCoupons ? b.coupon_discount_brl : 0);
         if (aInst !== bInst) return aInst - bInst;
         return b.installments_count - a.installments_count;
       }
-      return a.effective_net_price - b.effective_net_price;
+      const aNet = simulateCoupons
+        ? a.effective_net_price_with_coupon ?? a.effective_net_price
+        : a.effective_net_price;
+      const bNet = simulateCoupons
+        ? b.effective_net_price_with_coupon ?? b.effective_net_price
+        : b.effective_net_price;
+      return aNet - bNet;
     });
     return list;
-  }, [offers, paymentFilter, onlyInterestFree]);
+  }, [offers, paymentFilter, onlyInterestFree, simulateCoupons]);
 
   if (offers.length === 0 && rejectedCount === 0) return null;
 
@@ -115,6 +134,25 @@ export function ComparisonTable({
             </button>
           </div>
 
+          {/* Coupon Simulation Toggle */}
+          <label
+            className={`inline-flex cursor-pointer items-center gap-2 rounded-xl border px-3 py-2 text-xs font-medium transition ${
+              simulateCoupons
+                ? "border-amber-500/50 bg-amber-500/15 text-amber-200"
+                : "border-gray-800 bg-gray-900 text-gray-400 hover:text-gray-200"
+            }`}
+            title="Simular preço final aplicando os cupons de categoria/checkout encontrados"
+          >
+            <input
+              type="checkbox"
+              checked={simulateCoupons}
+              onChange={(e) => onSimulateCouponsChange(e.target.checked)}
+              className="rounded border-gray-700 bg-gray-900 text-amber-500"
+            />
+            <Tag className="h-3.5 w-3.5 text-amber-400" />
+            <span>Simular c/ Cupons</span>
+          </label>
+
           {paymentFilter === "installment" && (
             <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-indigo-500/30 bg-indigo-500/10 px-3 py-2 text-xs text-indigo-200">
               <input
@@ -148,7 +186,7 @@ export function ComparisonTable({
       {showRejected && rejectedReasons.length > 0 && (
         <div className="mb-4 rounded-xl border border-amber-500/20 bg-gray-900/80 p-3 text-xs text-gray-300">
           <p className="mb-1.5 font-semibold text-amber-300">
-            Anúncios descartados pela Trava Anti-Golpe:
+            Anúncios descartados pela Trava Anti-Golpe &amp; Anti-Downgrade:
           </p>
           <ul className="list-disc space-y-1 pl-4 text-gray-400">
             {rejectedReasons.map((r, i) => (
@@ -159,10 +197,10 @@ export function ComparisonTable({
       )}
 
       <div className="overflow-x-auto rounded-2xl border border-gray-800 bg-radar-surface shadow-xl">
-        <table className="w-full min-w-[840px] border-collapse text-left text-xs sm:text-sm">
+        <table className="w-full min-w-[860px] border-collapse text-left text-xs sm:text-sm">
           <thead>
             <tr className="border-b border-gray-800 bg-gray-900/80 text-[11px] uppercase tracking-wider text-gray-400">
-              <th className="px-4 py-3.5">Loja &amp; Vendedor</th>
+              <th className="px-4 py-3.5">Loja &amp; Canal</th>
               <th
                 className={`px-4 py-3.5 ${
                   paymentFilter === "pix" ? "text-cyan-300 font-bold" : ""
@@ -184,6 +222,8 @@ export function ComparisonTable({
               <th className="px-4 py-3.5">
                 {paymentFilter === "installment"
                   ? "Custo Efetivo Parcelado"
+                  : simulateCoupons
+                  ? "Custo Efetivo c/ Cupom"
                   : "Custo Efetivo Real"}
               </th>
               <th className="px-4 py-3.5 text-right">Oferta</th>
@@ -191,17 +231,26 @@ export function ComparisonTable({
           </thead>
           <tbody className="divide-y divide-gray-800/80">
             {displayedOffers.map((offer) => {
-              const benefitReturn = offer.best_benefit?.estimated_return_brl || 0;
+              const benefitReturn =
+                offer.best_benefit?.estimated_return_brl || 0;
+              const couponSub = simulateCoupons ? offer.coupon_discount_brl : 0;
               const effectiveInstallment = Math.max(
                 0,
-                offer.price_installment_total -
-                  offer.coupon_discount_brl -
-                  benefitReturn
+                offer.price_installment_total - couponSub - benefitReturn
               );
+              const baseNet = simulateCoupons
+                ? offer.effective_net_price_with_coupon ??
+                  offer.effective_net_price
+                : offer.effective_net_price;
               const effectiveDisplay =
                 paymentFilter === "installment"
                   ? effectiveInstallment
-                  : offer.effective_net_price;
+                  : baseNet;
+
+              const pixDisplay =
+                simulateCoupons && offer.price_pix_with_coupon
+                  ? offer.price_pix_with_coupon
+                  : offer.price_pix;
 
               return (
                 <tr key={offer.id} className="transition hover:bg-gray-900/50">
@@ -216,9 +265,15 @@ export function ComparisonTable({
                         </span>
                       )}
                     </div>
-                    <div className="mt-0.5 text-[11px] text-gray-400 line-clamp-1 max-w-[230px]">
+                    <div className="mt-0.5 text-[11px] text-gray-300 line-clamp-1 max-w-[240px]">
                       {offer.product_title}
                     </div>
+                    {offer.deal_note && (
+                      <div className="mt-0.5 flex items-center gap-1 text-[10px] text-amber-300/90 line-clamp-1 max-w-[240px]">
+                        <Info className="h-3 w-3 shrink-0" />
+                        <span>{offer.deal_note}</span>
+                      </div>
+                    )}
                     <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[11px] text-gray-400">
                       <span className="inline-flex items-center gap-1 text-emerald-400">
                         <ShieldCheck className="h-3 w-3" />
@@ -244,7 +299,14 @@ export function ComparisonTable({
                         : "font-semibold text-gray-100"
                     }`}
                   >
-                    {formatBRL(offer.price_pix)}
+                    <div>{formatBRL(pixDisplay)}</div>
+                    {!simulateCoupons &&
+                      offer.price_pix_with_coupon &&
+                      offer.price_pix_with_coupon < offer.price_pix && (
+                        <div className="text-[10px] text-amber-300">
+                          c/ cupom: {formatBRL(offer.price_pix_with_coupon)}
+                        </div>
+                      )}
                   </td>
 
                   <td
@@ -282,7 +344,9 @@ export function ComparisonTable({
                           {offer.applied_coupon.code}
                         </span>
                         <div className="mt-1 text-[11px] text-gray-400">
-                          -{formatBRL(offer.coupon_discount_brl)} •{" "}
+                          {offer.coupon_discount_brl > 0
+                            ? `-${formatBRL(offer.coupon_discount_brl)} • `
+                            : ""}
                           {offer.applied_coupon.status === "CONFIRMADO_HOJE"
                             ? "Confirmado hoje"
                             : "Testar no checkout"}
@@ -315,7 +379,16 @@ export function ComparisonTable({
                   </td>
 
                   <td className="px-4 py-3.5 font-mono text-base font-bold text-emerald-400">
-                    {formatBRL(effectiveDisplay)}
+                    <div>{formatBRL(effectiveDisplay)}</div>
+                    {!simulateCoupons &&
+                      offer.effective_net_price_with_coupon &&
+                      offer.effective_net_price_with_coupon <
+                        offer.effective_net_price && (
+                        <div className="text-[10px] font-normal text-amber-300">
+                          c/ cupom:{" "}
+                          {formatBRL(offer.effective_net_price_with_coupon)}
+                        </div>
+                      )}
                   </td>
 
                   <td className="px-4 py-3.5 text-right">

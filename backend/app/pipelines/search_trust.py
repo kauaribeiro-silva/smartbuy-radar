@@ -114,6 +114,39 @@ def _compact_search_query(query: str) -> str:
     return cleaned if len(cleaned) >= 4 else query.strip()
 
 
+def _expand_search_queries(product: IdentifiedProduct) -> list[str]:
+    """
+    Generate up to 2 complementary queries:
+    1. Clean commercial query
+    2. Short Brand + Model Code / SKU query (or 'PlayStation 5 Slim' synonym)
+    """
+    primary = _compact_search_query(product.search_query)
+    queries = [primary]
+
+    low = primary.lower()
+    if ("playstation 5" in low or "ps5" in low) and "slim" not in low and "pro" not in low:
+        queries.append("Console PlayStation 5 Slim")
+        return queries
+
+    codes = re.findall(
+        r"\b(?:[a-z]+\d+[a-z0-9]{2,}|\d+[a-z]+\d+[a-z0-9]*)\b",
+        f"{product.exact_model} {product.sku_part_number} {primary}",
+        flags=re.IGNORECASE,
+    )
+    if codes:
+        words = [
+            w
+            for w in primary.split()
+            if len(w) >= 2 and w.lower() not in ("gamer", "para", "com")
+        ]
+        brand_prefix = " ".join(words[:2]) if len(words) >= 2 else (product.brand or words[0])
+        short_q = f"{brand_prefix} {codes[-1]}".strip()
+        if short_q.lower() != primary.lower() and len(short_q) >= 4:
+            queries.append(short_q)
+
+    return queries[:2]
+
+
 def _matches_query_tokens(candidate_title: str, query: str) -> bool:
     """
     Ensure candidate product title matches key model codes / specs from the query
@@ -313,14 +346,15 @@ async def _search_kabum_live(query: str) -> list[dict[str, Any]]:
     return results
 
 
-async def _search_zoom_live(query: str) -> list[dict[str, Any]]:
+async def _search_zoom_live(query: str, base_host: str = "https://www.zoom.com.br") -> list[dict[str, Any]]:
     """
-    Query Zoom.com.br __NEXT_DATA__ Redux state for real-time multi-store Brazilian offers,
-    installment plans, and cashback rates.
+    Query Zoom.com.br or Buscape.com.br __NEXT_DATA__ Redux state for real-time multi-store
+    Brazilian offers, installment plans, and live cashback rates.
     """
     results: list[dict[str, Any]] = []
     compact = _compact_search_query(query)
-    search_url = f"https://www.zoom.com.br/search?q={quote_plus(compact)}"
+    search_url = f"{base_host}/search?q={quote_plus(compact)}"
+    portal_label = "Buscapé" if "buscape" in base_host else "Zoom"
     try:
         async with httpx.AsyncClient(
             headers=DEFAULT_HEADERS, follow_redirects=True, timeout=10.0
@@ -338,6 +372,7 @@ async def _search_zoom_live(query: str) -> list[dict[str, Any]]:
                 .get("initialReduxState", {})
             )
             hits = redux.get("hits", {}).get("hits", [])
+            merchant_cb_rates = (redux.get("merchantCashbacks") or {}).get("rates") or {}
             if not isinstance(hits, list):
                 return results
 
@@ -353,7 +388,7 @@ async def _search_zoom_live(query: str) -> list[dict[str, Any]]:
                 hit_type = h.get("type")
                 raw_url = str(h.get("url") or "")
                 full_url = (
-                    f"https://www.zoom.com.br{raw_url}"
+                    f"{base_host}{raw_url}"
                     if raw_url.startswith("/")
                     else (raw_url or search_url)
                 )
@@ -373,10 +408,18 @@ async def _search_zoom_live(query: str) -> list[dict[str, Any]]:
                 if not pix:
                     continue
 
+                cb_rate = float(
+                    ((h.get("cashback") or {}).get("formula") or {}).get("cashbackRate")
+                    or 0.0
+                )
+                if cb_rate <= 0:
+                    m_id = str(h.get("merchantId") or (h.get("bestOffer") or {}).get("merchantId") or "")
+                    cb_rate = float(merchant_cb_rates.get(m_id) or 0.0)
+                live_cb_pct = round(cb_rate * 100.0, 2) if 0 < cb_rate < 1 else round(cb_rate, 2)
+
                 inst = h.get("installments") or {}
                 inst_months = int(inst.get("amount_months") or 10)
                 inst_total = parse_brl_price(inst.get("total_value")) or pix
-                # Normalize rounding artifact (e.g. 6 * 89.83 = 538.98 vs 539.00)
                 if abs(inst_total - pix) < 1.0:
                     inst_total = pix
                 has_interest = bool(h.get("hasInterest", False)) and (inst_total > pix * 1.02)
@@ -396,6 +439,8 @@ async def _search_zoom_live(query: str) -> list[dict[str, Any]]:
                         "seller_rating": 4.9 if not is_mkt else 4.7,
                         "is_official_store": not is_mkt,
                         "in_stock": True,
+                        "source": portal_label,
+                        "live_cashback_pct": live_cb_pct,
                     }
                 )
 
@@ -562,17 +607,24 @@ async def search_and_filter_offers_v2(
     Pelando 72h, Promobit API, Gemini Grounding) + StrictSpecValidator (Travas A, B, C).
     """
     active_spec = spec or heuristic_contract(product.search_query, product.exact_model)
+    expanded_queries = _expand_search_queries(product)
+    primary_q = expanded_queries[0]
+    secondary_q = expanded_queries[1] if len(expanded_queries) > 1 else None
 
-    kabum_task = _search_kabum_live(product.search_query)
-    zoom_task = _search_zoom_live(product.search_query)
-    bing_task = _search_bing_shopping_live(product.search_query)
-    pelando_task = hunt_pelando_live(product.search_query, spec=active_spec)
-    promobit_task = hunt_promobit_live(product.search_query, spec=None)
+    kabum_task = _search_kabum_live(primary_q)
+    zoom_task = _search_zoom_live(primary_q, base_host="https://www.zoom.com.br")
+    buscape_task = _search_zoom_live(
+        secondary_q or primary_q, base_host="https://www.buscape.com.br"
+    )
+    bing_task = _search_bing_shopping_live(primary_q)
+    pelando_task = hunt_pelando_live(primary_q, spec=active_spec)
+    promobit_task = hunt_promobit_live(primary_q, spec=active_spec)
     gemini_task = _search_via_gemini_grounding(product)
 
     (
         kabum_res,
         zoom_res,
+        buscape_res,
         bing_res,
         pelando_res,
         promobit_res,
@@ -580,6 +632,7 @@ async def search_and_filter_offers_v2(
     ) = await asyncio.gather(
         kabum_task,
         zoom_task,
+        buscape_task,
         bing_task,
         pelando_task,
         promobit_task,
@@ -604,13 +657,24 @@ async def search_and_filter_offers_v2(
         )
     if isinstance(zoom_res, list):
         for o in zoom_res:
-            o.setdefault("source", "Zoom / Buscapé")
+            o.setdefault("source", "Zoom")
         raw_offers.extend(zoom_res)
         channels.append(
             ChannelStatus(
-                name="Zoom / Buscapé",
+                name="Zoom",
                 status="ok" if zoom_res else "vazio",
                 count=len(zoom_res),
+            )
+        )
+    if isinstance(buscape_res, list):
+        for o in buscape_res:
+            o.setdefault("source", "Buscapé")
+        raw_offers.extend(buscape_res)
+        channels.append(
+            ChannelStatus(
+                name="Buscapé",
+                status="ok" if buscape_res else "vazio",
+                count=len(buscape_res),
             )
         )
     if isinstance(bing_res, list):
@@ -715,6 +779,7 @@ async def search_and_filter_offers_v2(
                 installment_value=inst_val,
                 interest_free=bool(item.get("interest_free", True)),
                 effective_net_price=round(float(item["price_pix"]), 2),
+                live_cashback_pct=float(item.get("live_cashback_pct") or 0.0),
                 source=str(item.get("source") or ""),
                 deal_age_hours=item.get("deal_age_hours"),
                 deal_note=str(item.get("deal_note") or ""),

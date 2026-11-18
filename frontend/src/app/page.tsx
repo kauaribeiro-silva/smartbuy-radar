@@ -27,6 +27,7 @@ export default function HomePage() {
   const [isSearching, setIsSearching] = useState(false);
   const [mileValueBrl, setMileValueBrl] = useState(30);
   const [paymentFilter, setPaymentFilter] = useState<PaymentFilterMode>("all");
+  const [simulateCoupons, setSimulateCoupons] = useState(false);
   const [logs, setLogs] = useState<SSEEvent[]>([]);
   const [result, setResult] = useState<RadarResult | null>(null);
   const [ambiguityProduct, setAmbiguityProduct] =
@@ -360,6 +361,7 @@ export default function HomePage() {
               verdicts={result.verdicts}
               selectedVerdictType={selectedVerdict?.verdict_type || ""}
               onSelectVerdict={setSelectedVerdict}
+              simulateCoupons={simulateCoupons}
             />
 
             <HowToBuyGuide verdict={selectedVerdict} />
@@ -378,6 +380,8 @@ export default function HomePage() {
               rejectedReasons={result.rejected_reasons}
               paymentFilter={paymentFilter}
               onPaymentFilterChange={handlePaymentFilterChange}
+              simulateCoupons={simulateCoupons}
+              onSimulateCouponsChange={setSimulateCoupons}
             />
           </>
         )}

@@ -16,12 +16,14 @@ interface VerdictCardsProps {
   verdicts: VerdictCard[];
   selectedVerdictType: string;
   onSelectVerdict: (verdict: VerdictCard) => void;
+  simulateCoupons?: boolean;
 }
 
 export function VerdictCards({
   verdicts,
   selectedVerdictType,
   onSelectVerdict,
+  simulateCoupons = false,
 }: VerdictCardsProps) {
   if (!verdicts || verdicts.length === 0) return null;
 
@@ -65,6 +67,15 @@ export function VerdictCards({
           const st = styleMap[v.verdict_type] || styleMap.best_pix;
           const isSelected = selectedVerdictType === v.verdict_type;
 
+          const hasSimCoupon =
+            v.highlight_price_with_coupon_brl &&
+            v.highlight_price_with_coupon_brl < v.highlight_price_brl;
+
+          const displayPrice =
+            simulateCoupons && v.highlight_price_with_coupon_brl
+              ? v.highlight_price_with_coupon_brl
+              : v.highlight_price_brl;
+
           return (
             <motion.div
               key={v.verdict_type}
@@ -96,12 +107,25 @@ export function VerdictCards({
 
               <div className="mt-4 flex items-baseline gap-2">
                 <span className={`font-mono text-3xl font-extrabold ${st.accentText}`}>
-                  {formatBRL(v.highlight_price_brl)}
+                  {formatBRL(displayPrice)}
                 </span>
-                {v.verdict_type === "best_smart_hack" && (
+                {simulateCoupons && hasSimCoupon ? (
+                  <span className="rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-amber-300">
+                    c/ cupom
+                  </span>
+                ) : v.verdict_type === "best_smart_hack" ? (
                   <span className="text-[11px] text-gray-400">custo real</span>
-                )}
+                ) : null}
               </div>
+
+              {!simulateCoupons && hasSimCoupon && v.offer.applied_coupon && (
+                <p className="mt-1 text-[11px] font-medium text-amber-300">
+                  Se cupom <span className="font-mono">{v.offer.applied_coupon.code}</span> aplicar:{" "}
+                  <strong className="font-mono">
+                    {formatBRL(v.highlight_price_with_coupon_brl)}
+                  </strong>
+                </p>
+              )}
 
               {v.savings_vs_reference_brl && v.savings_vs_reference_brl > 0 && (
                 <p className="mt-1 text-xs font-medium text-emerald-400">
@@ -111,9 +135,10 @@ export function VerdictCards({
 
               <div className="mt-4 space-y-1.5 border-t border-gray-800/80 pt-3 text-xs text-gray-300">
                 <div className="flex justify-between">
-                  <span className="text-gray-500">Loja / Vendedor</span>
-                  <span className="font-medium text-gray-200 truncate max-w-[170px]">
-                    {v.offer.store_name} ({v.offer.seller_name})
+                  <span className="text-gray-500">Loja / Canal</span>
+                  <span className="font-medium text-gray-200 truncate max-w-[180px]">
+                    {v.offer.store_name}
+                    {v.offer.source ? ` • ${v.offer.source}` : ""}
                   </span>
                 </div>
 
@@ -122,7 +147,10 @@ export function VerdictCards({
                     <span className="text-gray-500">Cupom Ativo</span>
                     <span className="inline-flex items-center gap-1 rounded bg-amber-500/15 px-1.5 py-0.5 font-mono text-[11px] font-semibold text-amber-300">
                       <Tag className="h-3 w-3" />
-                      {v.offer.applied_coupon.code} (-{formatBRL(v.offer.coupon_discount_brl)})
+                      {v.offer.applied_coupon.code}
+                      {v.offer.coupon_discount_brl > 0
+                        ? ` (-${formatBRL(v.offer.coupon_discount_brl)})`
+                        : ""}
                     </span>
                   </div>
                 )}

@@ -72,6 +72,9 @@ class StoreOffer(BaseModel):
     coupon_discount_brl: float = 0.0
     best_benefit: BenefitOption | None = None
     effective_net_price: float = 0.0
+    price_pix_with_coupon: float = 0.0
+    effective_net_price_with_coupon: float = 0.0
+    live_cashback_pct: float = 0.0
     all_coupons: list[CouponInfo] = Field(default_factory=list)
     all_benefits: list[BenefitOption] = Field(default_factory=list)
     # v2.0 — provenance & community signals
@@ -139,6 +142,8 @@ class VerdictCard(BaseModel):
     offer: StoreOffer
     highlight_price_brl: float
     net_price_brl: float
+    highlight_price_with_coupon_brl: float = 0.0
+    net_price_with_coupon_brl: float = 0.0
     savings_vs_reference_brl: float | None = None
     how_to_buy_steps: list[str] = Field(default_factory=list)
 

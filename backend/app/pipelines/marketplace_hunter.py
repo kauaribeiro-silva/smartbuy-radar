@@ -113,6 +113,58 @@ async def _enrich_pelando_deal(
             code = _extract_pelando_coupon_code(resp.text)
             if code and not item.get("embedded_coupon_code"):
                 item["embedded_coupon_code"] = code
+            # Extract community instruction snippet if present
+            m_inst = re.search(
+                r"(?:cupom|pix|parcelad|app|resgate)[^<\n]{10,140}",
+                resp.text,
+                re.IGNORECASE,
+            )
+            if m_inst and "<" not in m_inst.group(0):
+                clean_hint = re.sub(r"\s+", " ", m_inst.group(0)).strip(" \"',.;:")
+                if len(clean_hint) >= 12:
+                    item["deal_note"] = f"Dica Pelando: {clean_hint[:130]}"
+    except Exception:
+        pass
+    return item
+
+
+async def _enrich_promobit_deal(
+    client: httpx.AsyncClient, item: dict[str, Any]
+) -> dict[str, Any]:
+    """Fetch Promobit offer detail __NEXT_DATA__ to extract author instructions (offerInstructionsRaw)."""
+    url = item.get("product_url", "")
+    if "promobit.com.br/oferta/" not in url:
+        return item
+    try:
+        resp = await client.get(url, timeout=8.0)
+        if resp.status_code != 200:
+            return item
+        soup = BeautifulSoup(resp.text, "lxml")
+        nd = soup.find("script", id="__NEXT_DATA__")
+        if not nd or not nd.string:
+            return item
+        so = (
+            json.loads(nd.string)
+            .get("props", {})
+            .get("pageProps", {})
+            .get("serverOffer", {})
+        )
+        if not isinstance(so, dict):
+            return item
+        inst = str(
+            so.get("offerInstructionsRaw")
+            or so.get("offerInstructions")
+            or so.get("offerUserDescription")
+            or ""
+        ).strip()
+        inst = re.sub(r"<[^>]+>", " ", inst)
+        inst = re.sub(r"\s+", " ", inst).strip()
+        if inst and len(inst) >= 6:
+            item["deal_note"] = f"Instrução Promobit: {inst[:160]}"
+            if not item.get("embedded_coupon_code"):
+                code = _extract_pelando_coupon_code(inst)
+                if code:
+                    item["embedded_coupon_code"] = code
     except Exception:
         pass
     return item
@@ -339,6 +391,16 @@ async def hunt_promobit_live(
                         "embedded_coupon_code": coupon_code,
                         "page_coupon": page_coupon,
                     }
+                )
+
+            # Enrich top 3 matching Promobit deals with author checkout instructions
+            matching_pro = [
+                o for o in offers if (spec is None or check_title(o["product_title"], spec) is None)
+            ][:3]
+            if matching_pro:
+                await asyncio.gather(
+                    *[_enrich_promobit_deal(client, o) for o in matching_pro],
+                    return_exceptions=True,
                 )
 
             return (

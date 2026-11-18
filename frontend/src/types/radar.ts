@@ -63,6 +63,9 @@ export interface StoreOffer {
   coupon_discount_brl: number;
   best_benefit: BenefitOption | null;
   effective_net_price: number;
+  price_pix_with_coupon?: number;
+  effective_net_price_with_coupon?: number;
+  live_cashback_pct?: number;
   all_coupons: CouponInfo[];
   all_benefits: BenefitOption[];
   source?: string;
@@ -79,6 +82,8 @@ export interface VerdictCard {
   offer: StoreOffer;
   highlight_price_brl: number;
   net_price_brl: number;
+  highlight_price_with_coupon_brl?: number;
+  net_price_with_coupon_brl?: number;
   savings_vs_reference_brl: number | null;
   how_to_buy_steps: string[];
 }

@@ -83,6 +83,10 @@ CREATE TABLE IF NOT EXISTS price_history (
     recorded_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_history_product ON price_history(product_id, recorded_at);
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -378,3 +382,47 @@ def active_alert(prod: dict[str, Any], max_age_hours: float = 48.0) -> Optional[
         "amount": prod.get("alert_amount"),
         "at": at,
     }
+
+
+def get_setting(key: str, default: str = "") -> str:
+    rows = _query("SELECT value FROM app_settings WHERE key = ?", (key,))
+    return str(rows[0]["value"]) if rows else default
+
+
+def set_setting(key: str, value: str) -> None:
+    _execute(
+        "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value.strip()),
+    )
+
+
+def get_telegram_config() -> dict[str, str]:
+    token = get_setting("telegram_bot_token") or os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = get_setting("telegram_chat_id") or os.environ.get("TELEGRAM_CHAT_ID", "")
+    return {"bot_token": token, "chat_id": chat_id}
+
+
+async def send_telegram_alert(message: str) -> bool:
+    """Send a real-time alert message to the user's Telegram chat if configured."""
+    import httpx
+
+    cfg = get_telegram_config()
+    token = cfg.get("bot_token", "").strip()
+    chat_id = cfg.get("chat_id", "").strip()
+    if not token or not chat_id:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": message,
+                    "disable_web_page_preview": False,
+                },
+            )
+            return resp.status_code == 200
+    except Exception as exc:
+        logger.warning("Falha ao enviar alerta Telegram: %s", exc)
+        return False
+

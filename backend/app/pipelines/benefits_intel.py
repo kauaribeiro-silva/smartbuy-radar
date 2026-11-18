@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 from datetime import datetime
+
+import httpx
 from google import genai
 from google.genai import types
 
 from app.config import settings
 from app.models import BenefitOption, IdentifiedProduct, StoreOffer
+from app.pipelines.coupon_hunter import CUPONOMIA_SLUGS
+from app.utils.browser import DEFAULT_HEADERS
 from app.utils.parsers import extract_json_from_llm
 
 logger = logging.getLogger(__name__)
@@ -43,15 +49,6 @@ BASELINE_STORE_BENEFITS: dict[str, list[dict[str, str | float]]] = {
             "rule_summary": "Pontuação base Livelo em produtos vendidos e entregues por KaBuM!.",
             "portal_url": "https://www.livelo.com.br",
         },
-        {
-            "platform": "Cuponomia",
-            "benefit_type": "cashback",
-            "rate_label": "1.5% cashback",
-            "points_per_brl": 0.0,
-            "cashback_percent": 1.5,
-            "rule_summary": "Cashback ativando pelo portal Cuponomia antes de adicionar ao carrinho.",
-            "portal_url": "https://www.cuponomia.com.br/desconto/kabum",
-        },
     ],
     "Magazine Luiza": [
         {
@@ -62,15 +59,6 @@ BASELINE_STORE_BENEFITS: dict[str, list[dict[str, str | float]]] = {
             "cashback_percent": 0.0,
             "rule_summary": "Acúmulo em produtos vendidos e entregues por Magalu via hotsite Livelo.",
             "portal_url": "https://www.livelo.com.br",
-        },
-        {
-            "platform": "Inter Shop",
-            "benefit_type": "cashback",
-            "rate_label": "2% cashback",
-            "points_per_brl": 0.0,
-            "cashback_percent": 2.0,
-            "rule_summary": "Cashback direto na conta via redirecionamento Inter Shop / Zoom.",
-            "portal_url": "https://www.zoom.com.br",
         },
     ],
     "Fast Shop": [
@@ -88,11 +76,22 @@ BASELINE_STORE_BENEFITS: dict[str, list[dict[str, str | float]]] = {
         {
             "platform": "Meli+ / Méliuz",
             "benefit_type": "cashback",
-            "rate_label": "1% cashback",
+            "rate_label": "1.5% cashback",
             "points_per_brl": 0.0,
-            "cashback_percent": 1.0,
+            "cashback_percent": 1.5,
             "rule_summary": "Benefício Meli+ / portal parceiro com carrinho limpo.",
             "portal_url": "https://www.mercadolivre.com.br",
+        },
+    ],
+    "Shopee Oficial": [
+        {
+            "platform": "Cuponomia / Moedas Shopee",
+            "benefit_type": "cashback",
+            "rate_label": "2% cashback",
+            "points_per_brl": 0.0,
+            "cashback_percent": 2.0,
+            "rule_summary": "Cashback em Lojas Oficiais (Shopee Mall) via portal parceiro.",
+            "portal_url": "https://www.cuponomia.com.br/desconto/shopee",
         },
     ],
     "Carrefour": [
@@ -140,14 +139,53 @@ def calculate_benefit_value_brl(
     return 0, 0.0
 
 
+async def _scrape_live_cuponomia_cashback(store_name: str) -> BenefitOption | None:
+    """Scrape today's real cashback percentage directly from Cuponomia store page."""
+    slug = CUPONOMIA_SLUGS.get(store_name)
+    if not slug:
+        return None
+    url = f"https://www.cuponomia.com.br/desconto/{slug}"
+    try:
+        async with httpx.AsyncClient(
+            headers=DEFAULT_HEADERS, follow_redirects=True, timeout=7.5
+        ) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                return None
+            # Look for explicit cashback rate like "2,1% de cashback" or "até 5% de cashback (era 1,5%)"
+            m_std = re.search(
+                r"\(era\s+(\d+(?:,\d+)?)%\)|(\d+(?:,\d+)?)%\s*de\s*cashback",
+                resp.text,
+                re.IGNORECASE,
+            )
+            if not m_std:
+                return None
+            raw_pct = (m_std.group(1) or m_std.group(2) or "0").replace(",", ".")
+            pct = float(raw_pct)
+            if pct <= 0 or pct > 25:
+                return None
+            return BenefitOption(
+                platform="Cuponomia",
+                store_name=store_name,
+                benefit_type="cashback",
+                rate_label=f"{pct:g}% cashback (Ao Vivo)",
+                points_per_brl=0.0,
+                cashback_percent=pct,
+                rule_summary=f"Taxa de cashback verificada hoje no Cuponomia para {store_name}.",
+                portal_url=url,
+            )
+    except Exception:
+        return None
+
+
 async def analyze_points_and_cashback(
     product: IdentifiedProduct,
     offers: list[StoreOffer],
     mile_value_brl: float = 30.0,
 ) -> dict[str, list[BenefitOption]]:
     """
-    Pipeline 4: Cross-reference active Livelo, Esfera, Méliuz, Inter Shop, Cuponomia,
-    Zoom/Buscapé, Nubank Shopping, and native store perks for every trusted store.
+    Pipeline 4: Cross-reference active Livelo, Esfera, Méliuz, Inter Shop, Cuponomia (live HTTPX),
+    Zoom/Buscapé live Redux rates, and native store perks for every trusted store.
     """
     if not offers:
         return {}
@@ -155,6 +193,34 @@ async def analyze_points_and_cashback(
     unique_stores = list(dict.fromkeys(o.store_name for o in offers))
     benefits_by_store: dict[str, list[BenefitOption]] = {s: [] for s in unique_stores}
 
+    # 1. Inject live cashback rates extracted directly from Zoom / Buscapé __NEXT_DATA__
+    for o in offers:
+        if o.live_cashback_pct and o.live_cashback_pct > 0:
+            existing = benefits_by_store.get(o.store_name, [])
+            if not any(b.platform.startswith("Zoom") for b in existing):
+                existing.append(
+                    BenefitOption(
+                        platform="Zoom / Buscapé",
+                        store_name=o.store_name,
+                        benefit_type="cashback",
+                        rate_label=f"{o.live_cashback_pct:g}% cashback (Ao Vivo)",
+                        points_per_brl=0.0,
+                        cashback_percent=o.live_cashback_pct,
+                        rule_summary="Cashback real extraído da oferta no comparador Zoom/Buscapé.",
+                        portal_url="https://www.zoom.com.br",
+                    )
+                )
+
+    # 2. Scrape live Cuponomia cashback percentages in parallel
+    live_cuponomia = await asyncio.gather(
+        *[_scrape_live_cuponomia_cashback(s) for s in unique_stores],
+        return_exceptions=True,
+    )
+    for res in live_cuponomia:
+        if isinstance(res, BenefitOption):
+            benefits_by_store[res.store_name].append(res)
+
+    # 3. Try Gemini Search Grounding for promotional Livelo/Esfera campaigns (e.g. 5 to 10 pts/R$)
     parsed = None
     if settings.gemini_api_key:
         try:
@@ -164,10 +230,7 @@ async def analyze_points_and_cashback(
                 f"Hoje é {today_str}. Você é um especialista em Pontos, Milhas e Cashback no Brasil.\n"
                 f"Produto: {product.exact_model} (Categoria: {product.category}).\n"
                 f"Lojas encontradas: {', '.join(unique_stores)}.\n\n"
-                "Use o Google Search para consultar as taxas ATIVAS HOJE de:\n"
-                "1. Programas de Pontos: Livelo (pontos por real) e Esfera (pontos por real) para essas lojas.\n"
-                "2. Cashback e Shoppings de Bancos: Méliuz, Cuponomia, Inter Shop, Zoom, Buscapé e Nubank Shopping.\n"
-                "3. Vantagens Nativas: Meli+ (Mercado Livre), Amazon Prime / Cartão Amazon, MagaluPay, desconto App.\n\n"
+                "Use o Google Search para consultar as taxas ATIVAS HOJE de Livelo, Esfera, Méliuz e Inter Shop.\n"
                 "Retorne EXCLUSIVAMENTE um JSON array:\n"
                 "[\n"
                 "  {\n"
@@ -193,8 +256,8 @@ async def analyze_points_and_cashback(
             parsed = extract_json_from_llm(response.text or "")
         except Exception as exc:
             logger.warning(
-                "Gemini Search falhou em analyze_points_and_cashback (%s); aplicando tabela base de parceiros.",
-                exc,
+                "Gemini Search falhou em analyze_points_and_cashback (%s); usando taxas ao vivo + tabela base.",
+                str(exc)[:100],
             )
 
     if isinstance(parsed, list) and parsed:
@@ -240,10 +303,11 @@ async def analyze_points_and_cashback(
                 )
             )
 
-    # Ensure every store has at least baseline partner benefits if Gemini didn't populate it
+    # 4. Merge baseline Livelo/Esfera/Méliuz options so points vs cashback comparison is always complete
     for store in unique_stores:
-        if not benefits_by_store.get(store):
-            base_list = BASELINE_STORE_BENEFITS.get(store, [
+        base_list = BASELINE_STORE_BENEFITS.get(
+            store,
+            [
                 {
                     "platform": "Zoom / Buscapé",
                     "benefit_type": "cashback",
@@ -253,8 +317,11 @@ async def analyze_points_and_cashback(
                     "rule_summary": "Cashback padrão via comparador oficial.",
                     "portal_url": "https://www.zoom.com.br",
                 }
-            ])
-            for b in base_list:
+            ],
+        )
+        existing_platforms = {b.platform.lower() for b in benefits_by_store[store]}
+        for b in base_list:
+            if str(b["platform"]).lower() not in existing_platforms:
                 benefits_by_store[store].append(
                     BenefitOption(
                         platform=str(b["platform"]),

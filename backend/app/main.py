@@ -29,6 +29,9 @@ from app.db import (
     set_watching,
     touch_checked,
     update_after_refresh,
+    get_telegram_config,
+    set_setting,
+    send_telegram_alert,
 )
 from app.models import IdentifiedProduct
 from app.pipelines.coupon_hunter import hunt_live_coupons
@@ -43,10 +46,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+async def _periodic_monitor_loop() -> None:
+    """24/7 Background Price & Coupon Monitor running every 30 minutes."""
+    while True:
+        await asyncio.sleep(1800)
+        try:
+            await _background_refresh_stale()
+        except Exception as exc:
+            logger.debug("Periodic monitor loop error: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
-    yield
+    monitor_task = asyncio.create_task(_periodic_monitor_loop())
+    try:
+        yield
+    finally:
+        monitor_task.cancel()
 
 
 app = FastAPI(
@@ -164,6 +181,10 @@ async def _refresh_single_tracked(product_id: int) -> dict[str, Any] | None:
         alert_message=alert_msg,
         alert_amount=alert_amount,
     )
+    if alert_msg:
+        asyncio.create_task(
+            send_telegram_alert(f"{alert_msg}\n🔗 Oferta: {best.product_url}")
+        )
     record_price(
         product_id,
         price_pix=best.price_pix,
@@ -291,6 +312,53 @@ async def remove_tracked_product(
     _verify_auth(x_radar_key)
     delete_product(product_id)
     return {"ok": True}
+
+
+class TelegramConfigBody(BaseModel):
+    bot_token: str = ""
+    chat_id: str = ""
+    send_test: bool = True
+
+
+@app.get("/api/memory/telegram")
+async def read_telegram_config(
+    x_radar_key: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    _verify_auth(x_radar_key)
+    cfg = get_telegram_config()
+    masked_token = (
+        f"{cfg['bot_token'][:8]}...{cfg['bot_token'][-4:]}"
+        if len(cfg.get("bot_token", "")) > 12
+        else ""
+    )
+    return {
+        "configured": bool(cfg.get("bot_token") and cfg.get("chat_id")),
+        "masked_token": masked_token,
+        "chat_id": cfg.get("chat_id", ""),
+    }
+
+
+@app.post("/api/memory/telegram")
+async def save_telegram_config(
+    body: TelegramConfigBody,
+    x_radar_key: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    _verify_auth(x_radar_key)
+    if body.bot_token.strip():
+        set_setting("telegram_bot_token", body.bot_token.strip())
+    if body.chat_id.strip():
+        set_setting("telegram_chat_id", body.chat_id.strip())
+
+    test_sent = False
+    if body.send_test:
+        test_sent = await send_telegram_alert(
+            "✅ SmartBuy Radar v2.0 conectado! Você receberá alertas automáticos de queda de preço e novos cupons aqui."
+        )
+    cfg = get_telegram_config()
+    return {
+        "configured": bool(cfg.get("bot_token") and cfg.get("chat_id")),
+        "test_sent": test_sent,
+    }
 
 
 @app.post("/api/radar/stream")
