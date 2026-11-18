@@ -152,8 +152,9 @@ FAMILY_ANCHORS = {
 
 NOISE_TOKENS = {
     "hdr10", "hdr400", "hdr600", "hdr", "4k", "8k", "5g", "4g", "1080p", "1440p", "2160p", "720p",
-    "fhd", "uhd", "qhd", "wqhd", "usb", "hdmi", "led", "ips", "va", "tn", "wifi", "nfc",
-    "gsync", "freesync", "nvidia", "amd",
+    "fhd", "uhd", "qhd", "wqhd", "full", "hd", "fullhd", "usb", "hdmi", "dp", "displayport", "vga",
+    "led", "wled", "ips", "va", "tn", "wifi", "nfc", "gsync", "freesync", "sync", "adaptive",
+    "nvidia", "amd", "srgb", "vesa", "bivolt", "mprt", "gtg", "mbr", "nativo", "widescreen",
 }
 
 STOPWORDS = {
@@ -208,7 +209,14 @@ def _token_present(token: str, tokens: set[str], flat_title: str) -> bool:
         for tok in tokens:
             if tok.startswith(t) and tok[len(t):] in UNITS:
                 return True
-    if len(t) >= 4 and t in flat_title.replace(" ", ""):
+    compact_title = flat_title.replace(" ", "")
+    if len(t) >= 4 and t in compact_title:
+        return True
+    if len(t) >= 3 and re.search(r"[a-z]", t) and re.search(r"\d", t) and t in compact_title:
+        return True
+    if t in ("agon", "ultragear", "odyssey", "nitro") and any(
+        code in compact_title for code in ("g50", "27g", "24g", "g3", "g4", "g5", "vg2", "kg2")
+    ):
         return True
     return False
 
@@ -254,8 +262,13 @@ def heuristic_contract(query: str, canonical_name: str | None = None) -> SpecCon
         if t.isdigit():
             prev = qt[i - 1] if i > 0 else ""
             nxt = qt[i + 1] if i + 1 < len(qt) else ""
-            if len(t) >= 3 or prev in FAMILY_ANCHORS or nxt in ("polegadas", "pol", "hz"):
-                if not has_specific_model_code:
+            is_screen_size = (
+                len(t) == 2
+                and 18 <= int(t) <= 85
+                and bool(qset & {"monitor", "tv", "tela", "polegadas", "pol", "agon", "ultragear", "odyssey"})
+            )
+            if is_screen_size or len(t) >= 3 or prev in FAMILY_ANCHORS or nxt in ("polegadas", "pol", "hz"):
+                if is_screen_size or not has_specific_model_code:
                     mandatory[t] = None
         elif len(t) >= 3 and t not in CATEGORY_WORDS:
             # Brand / product line token (e.g. nintendo, switch, aoc, agon, iphone, samsung)

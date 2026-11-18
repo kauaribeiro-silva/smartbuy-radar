@@ -23,7 +23,11 @@ from app.models import (
     SpecContract,
     StoreOffer,
 )
-from app.pipelines.marketplace_hunter import hunt_pelando_live, hunt_promobit_live
+from app.pipelines.marketplace_hunter import (
+    hunt_mercadolivre_direct,
+    hunt_pelando_live,
+    hunt_promobit_live,
+)
 from app.pipelines.spec_validator import (
     apply_price_floor,
     apply_spec_filter,
@@ -89,12 +93,17 @@ def _normalize_store(merchant_name: str, fallback_url: str = "") -> tuple[str, s
 
 def _compact_search_query(query: str) -> str:
     """
-    Strip noisy marketing tokens ONLY when a specific alphanumeric model code (like 24G50F)
-    is present. For general searches (like 'Monitor 27 polegadas 144hz' or 'PlayStation 5'),
-    preserve size and refresh rate so stores return matching products.
+    Strip noisy display/marketing adjectives from long user queries so search engines
+    (KaBuM!, Zoom, Buscapé, Pelando, Promobit) return maximum matching offers.
     """
     cleaned = re.sub(r'["”″\']', " ", query)
     cleaned = re.sub(r"\bpolegadas\b", " ", cleaned, flags=re.IGNORECASE)
+    always_noise = (
+        r"\b(1ms|0[.,]5ms|5ms|hdr10|hdr|g-sync|gsync|freesync|amd|nvidia|"
+        r"full\s*hd|fhd|1920x1080|hdmi|displayport|nativo|mbr|wled|led|ips|va|tn)\b"
+    )
+    cleaned = re.sub(always_noise, " ", cleaned, flags=re.IGNORECASE)
+
     has_model_code = bool(
         re.search(
             r"\b(?:[a-z]+\d+[a-z0-9]{2,}|\d+[a-z]+\d+[a-z0-9]*)\b",
@@ -103,12 +112,8 @@ def _compact_search_query(query: str) -> str:
         )
     )
     if has_model_code:
-        noise = (
-            r"\b(144hz|165hz|180hz|240hz|60hz|75hz|120hz|1ms|0[.,]5ms|5ms|hdr10|hdr|"
-            r"g-sync|gsync|freesync|amd|nvidia|full\s*hd|fhd|1920x1080|hdmi|displayport|"
-            r"nativo|mbr|wled|led|ips|va|tn|preto|branco)\b"
-        )
-        cleaned = re.sub(noise, " ", cleaned, flags=re.IGNORECASE)
+        hz_noise = r"\b(144hz|165hz|180hz|240hz|60hz|75hz|120hz|preto|branco)\b"
+        cleaned = re.sub(hz_noise, " ", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\b\d{2}(?:[.,]\d)?\b", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned if len(cleaned) >= 4 else query.strip()
@@ -617,6 +622,7 @@ async def search_and_filter_offers_v2(
         secondary_q or primary_q, base_host="https://www.buscape.com.br"
     )
     bing_task = _search_bing_shopping_live(primary_q)
+    ml_task = hunt_mercadolivre_direct(primary_q, spec=active_spec)
     pelando_task = hunt_pelando_live(primary_q, spec=active_spec)
     promobit_task = hunt_promobit_live(primary_q, spec=active_spec)
     gemini_task = _search_via_gemini_grounding(product)
@@ -626,6 +632,7 @@ async def search_and_filter_offers_v2(
         zoom_res,
         buscape_res,
         bing_res,
+        ml_res,
         pelando_res,
         promobit_res,
         gemini_res,
@@ -634,6 +641,7 @@ async def search_and_filter_offers_v2(
         zoom_task,
         buscape_task,
         bing_task,
+        ml_task,
         pelando_task,
         promobit_task,
         gemini_task,
@@ -688,9 +696,21 @@ async def search_and_filter_offers_v2(
                 count=len(bing_res),
             )
         )
+    if isinstance(ml_res, tuple):
+        ml_offers, ml_status = ml_res
+        raw_offers.extend(ml_offers)
+        for mo in ml_offers:
+            pc = mo.get("page_coupon")
+            if isinstance(pc, CouponInfo):
+                community_coupons.append(pc)
+        channels.append(ml_status)
     if isinstance(pelando_res, tuple):
         pel_offers, pel_status = pelando_res
         raw_offers.extend(pel_offers)
+        for po in pel_offers:
+            pc = po.get("page_coupon")
+            if isinstance(pc, CouponInfo):
+                community_coupons.append(pc)
         channels.append(pel_status)
     if isinstance(promobit_res, tuple):
         pro_offers, pro_coupons, pro_status = promobit_res

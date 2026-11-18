@@ -22,8 +22,9 @@ from app.utils.parsers import extract_product_metadata, parse_brl_price
 
 logger = logging.getLogger(__name__)
 
-# Maximum age (in hours) for a community deal even before live-store price verification
-MAX_COMMUNITY_AGE_HOURS = 12.0
+# Maximum age (in hours) for a community deal (blocks 4-5 day old expired 11.11 posts while keeping today/yesterday deals)
+MAX_COMMUNITY_AGE_HOURS = 36.0
+MAX_SHOPEE_FLASH_AGE_HOURS = 24.0
 
 EXPIRED_COMMENT_MARKERS = (
     "acabou",
@@ -41,12 +42,54 @@ EXPIRED_COMMENT_MARKERS = (
     "preço normal",
 )
 
+COMMUNITY_NOISE_WORDS = {
+    "gamer", "full", "hd", "fhd", "uhd", "qhd", "wqhd", "ips", "va", "tn", "led", "wled",
+    "hdr10", "hdr", "hdr400", "g-sync", "gsync", "freesync", "sync", "adaptive", "hdmi",
+    "displayport", "dp", "vga", "usb", "preto", "branco", "bivolt", "polegadas", "pol",
+    "0,5ms", "0.5ms", "1ms", "5ms", "05ms", "nativo", "mbr", "mprt", "srgb", "widescreen",
+}
+
+
+def _build_community_queries(query: str) -> list[str]:
+    """
+    Build 1-2 concise 3-4 word queries for Pelando and Promobit search engines
+    so long 8-10 word titles don't return 0 results.
+    """
+    clean = re.sub(r'["”″\']', " ", query.lower())
+    clean = re.sub(r"\b0[.,]5\s*ms\b", " ", clean)
+    tokens = [
+        t for t in re.findall(r"[a-z0-9]+", clean)
+        if t not in COMMUNITY_NOISE_WORDS and len(t) >= 2
+    ]
+    if not tokens:
+        return [query.strip()]
+
+    queries: list[str] = []
+    # 1. Specific alphanumeric model / line tokens (e.g. "aoc agon g50" or "lg ultragear 27")
+    non_cat = [
+        t for t in tokens
+        if t not in ("monitor", "console", "smartphone", "celular", "notebook", "smart", "tv")
+        and not t.endswith("hz")
+    ]
+    if len(non_cat) >= 2:
+        q1 = " ".join(non_cat[:4])
+        queries.append(q1)
+
+    # 2. Category + brand + size/key token (e.g. "monitor aoc 27")
+    q2 = " ".join(tokens[:4])
+    if q2 not in queries:
+        queries.append(q2)
+
+    return queries[:2]
+
 
 def _parse_age_hours(age_str: str) -> float | None:
-    """Convert Pelando relative timestamps like '15 h', '2 d', '30 min' into hours."""
+    """Convert Pelando relative timestamps like '14 h', '14 hs', '2 dias', 'ontem', '30 min' into hours."""
     s = (age_str or "").strip().lower()
     if "agora" in s or "seg" in s:
         return 0.05
+    if "ontem" in s:
+        return 24.0
     m_min = re.search(r"(\d+)\s*min", s)
     if m_min:
         return round(float(m_min.group(1)) / 60.0, 2)
@@ -118,13 +161,72 @@ def _canonical_store(raw_store: str) -> tuple[str, str]:
     return s or "Comunidade", "pelando.com.br"
 
 
+def _is_login_walled_marketplace(url_or_store: str) -> bool:
+    low = (url_or_store or "").lower()
+    return any(
+        k in low
+        for k in (
+            "shopee.com.br",
+            "s.shopee.com.br",
+            "shopee oficial",
+            "mercadolivre.com.br",
+            "mercadolibre.com",
+            "meli.la",
+            "mercado livre",
+            "aliexpress.com",
+        )
+    )
+
+
+def _extract_ml_native_coupon(html: str, base_price: float) -> CouponInfo | None:
+    """Detect native 'R$ 640,17 com Cupom' or 'R$ 30 OFF com cupom' badge on Mercado Livre."""
+    soup = BeautifulSoup(html, "lxml")
+    txt = soup.get_text(" ", strip=True)
+    m_final = re.search(
+        r"R\$\s*(\d{1,5}(?:\.\d{3})*(?:,\d{1,2})?)\s+com\s+cupom",
+        txt,
+        re.IGNORECASE,
+    )
+    if m_final:
+        with_cup = parse_brl_price(m_final.group(1))
+        if with_cup and 0 < (base_price - with_cup) <= base_price * 0.35:
+            disc = round(base_price - with_cup, 2)
+            return CouponInfo(
+                code="CUPOM NO ANÚNCIO ML",
+                store_name="Mercado Livre",
+                discount_type="fixed",
+                discount_value=disc,
+                status="CONFIRMADO_HOJE",
+                rule_description=f"Marque a caixa 'Aplicar cupom' na página do Mercado Livre (vai para R$ {with_cup:,.2f})",
+                source="Cupom Nativo Mercado Livre",
+            )
+    m_off = re.search(
+        r"(?:compre\s+r\$\s*\d+\s+e\s+)?ganhe\s+r\$\s*(\d+)\s*off|cupom\s+de\s+r\$\s*(\d+)\s*off",
+        txt,
+        re.IGNORECASE,
+    )
+    if m_off:
+        val = float(m_off.group(1) or m_off.group(2) or 0)
+        if 5 <= val <= base_price * 0.35:
+            return CouponInfo(
+                code="CUPOM NO ANÚNCIO ML",
+                store_name="Mercado Livre",
+                discount_type="fixed",
+                discount_value=val,
+                status="CONFIRMADO_HOJE",
+                rule_description=f"Marque o cupom de R$ {val:,.0f} OFF na página do produto no Mercado Livre",
+                source="Cupom Nativo Mercado Livre",
+            )
+    return None
+
+
 async def _verify_and_enrich_pelando_deal(
     client: httpx.AsyncClient, item: dict[str, Any]
 ) -> dict[str, Any] | None:
     """
-    Fetch Pelando deal detail page, decode the direct store URL, and VERIFY that the
-    price is actually live on the target store right now. If the store price cannot be
-    verified or no longer matches, return None so stale community posts never appear.
+    Fetch Pelando deal detail page, check expiration/comments, decode the direct store URL,
+    and verify live price on open-HTML retailers while preserving active (<24h-36h)
+    Shopee and Mercado Livre deals behind login walls.
     """
     deal_url = item["product_url"]
     try:
@@ -135,36 +237,87 @@ async def _verify_and_enrich_pelando_deal(
         if '"isexpired":true' in low_html or '"inactive":true' in low_html:
             return None
 
+        # Check Pelando comments for expiration markers
+        comment_texts = re.findall(r'"content"\s*:\s*"([^"]+)"', resp.text)
+        if any(
+            any(m in c.lower() for m in EXPIRED_COMMENT_MARKERS)
+            for c in comment_texts
+        ):
+            return None
+
         direct_url = _decode_pelando_jwt_url(resp.text, deal_url)
         if direct_url == deal_url:
             return None
 
-        # Verify live store price on the target retailer page
-        store_resp = await client.get(direct_url, timeout=8.0)
-        if store_resp.status_code != 200:
-            return None
-        meta = extract_product_metadata(store_resp.text, direct_url)
-        if meta.get("in_stock") is False:
-            return None
-        live_price = meta.get("price_brl")
-        if not live_price or live_price <= 0:
-            # Target store did not confirm live price (e.g. Shopee login wall or dead link)
-            return None
-
-        # Use the REAL live price from the store page right now
-        item["product_url"] = direct_url
-        item["price_pix"] = live_price
-        item["price_installment_total"] = live_price
-        s_name, s_dom = _canonical_store(direct_url)
-        if s_name != direct_url:
-            item["store_name"] = s_name
-            item["store_domain"] = s_dom
-            item["seller_name"] = f"{s_name} (Preço Confirmado ao Vivo)"
-
         code = _extract_pelando_coupon_code(resp.text)
         if code and not item.get("embedded_coupon_code"):
             item["embedded_coupon_code"] = code
-        return item
+            item["page_coupon"] = CouponInfo(
+                code=code,
+                store_name=item["store_name"],
+                discount_type="fixed",
+                discount_value=0.0,
+                status="CONFIRMADO_HOJE",
+                rule_description=f"Cupom ativo reportado no Pelando ({item['product_title'][:50]})",
+                source="Pelando (Ativo Hoje)",
+            )
+
+        if "resgate todos os cupons" in low_html or "página de cupons" in low_html:
+            item["deal_note"] = (
+                f"{item.get('deal_note', '')} • Resgate o cupom da loja na página do anúncio"
+            ).strip(" •")
+
+        s_name, s_dom = _canonical_store(direct_url)
+        if s_name != direct_url and s_dom != "pelando.com.br":
+            item["store_name"] = s_name
+            item["store_domain"] = s_dom
+
+        is_walled = _is_login_walled_marketplace(direct_url) or _is_login_walled_marketplace(
+            item["store_name"]
+        )
+        age_h = float(item.get("deal_age_hours") or 0.0)
+        if "shopee" in item["store_name"].lower() and age_h > MAX_SHOPEE_FLASH_AGE_HOURS:
+            return None
+
+        # Try fetching the target store page to verify live price
+        headers = (
+            {"User-Agent": "Twitterbot/1.0", "Accept-Language": "pt-BR,pt;q=0.9"}
+            if "mercadolivre.com.br" in direct_url
+            else DEFAULT_HEADERS
+        )
+        try:
+            store_resp = await client.get(direct_url, headers=headers, timeout=7.0)
+            if store_resp.status_code in (404, 410):
+                return None
+            if store_resp.status_code == 200:
+                final_url = str(store_resp.url)
+                meta = extract_product_metadata(store_resp.text, final_url)
+                if meta.get("in_stock") is False:
+                    return None
+                live_price = meta.get("price_brl")
+                if live_price and live_price > 0:
+                    posted_price = float(item["price_pix"])
+                    if live_price > posted_price * 1.18 and not item.get("embedded_coupon_code"):
+                        return None
+                    item["price_pix"] = min(live_price, posted_price) if item.get("embedded_coupon_code") else live_price
+                    item["price_installment_total"] = item["price_pix"]
+                    item["product_url"] = final_url
+                    if "mercadolivre.com.br" in final_url and not item.get("page_coupon"):
+                        ml_cup = _extract_ml_native_coupon(store_resp.text, live_price)
+                        if ml_cup:
+                            item["page_coupon"] = ml_cup
+                    return item
+        except Exception:
+            if not is_walled:
+                return None
+
+        # Login-walled marketplaces (Shopee / Mercado Livre) don't expose price_brl to plain HTTPX
+        if is_walled:
+            item["product_url"] = direct_url
+            item["seller_name"] = f"{item['store_name']} (Oferta Ativa Pelando)"
+            return item
+
+        return None
     except Exception:
         return None
 
@@ -175,96 +328,110 @@ async def hunt_pelando_live(
     max_age_hours: float = MAX_COMMUNITY_AGE_HOURS,
 ) -> tuple[list[dict[str, Any]], ChannelStatus]:
     """
-    Search Pelando recent deals (< 12h) and keep ONLY offers whose price is verified live
-    on the target store right now.
+    Search Pelando recent deals using concise multi-query expansion so marketplace deals
+    (Shopee & Mercado Livre) are reliably discovered and verified.
     """
-    url = f"https://www.pelando.com.br/busca/{quote(query.strip())}"
+    queries = _build_community_queries(query)
     candidates: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
     try:
         async with httpx.AsyncClient(
             headers=DEFAULT_HEADERS, follow_redirects=True, timeout=10.0
         ) as client:
-            resp = await client.get(url)
-            if resp.status_code != 200:
-                return [], ChannelStatus(
-                    name="Pelando (Tempo Real)",
-                    status="indisponivel",
-                    detail=f"HTTP {resp.status_code}",
-                )
+            resps = await asyncio.gather(
+                *[
+                    client.get(f"https://www.pelando.com.br/busca/{quote(q)}")
+                    for q in queries
+                ],
+                return_exceptions=True,
+            )
 
-            soup = BeautifulSoup(resp.text, "lxml")
-            cards = soup.select("div[class*='_deal-card_']")
-            seen_urls: set[str] = set()
-
-            for card in cards[:15]:
-                if card.select_one("[data-inactive='true']") is not None:
+            for resp in resps:
+                if not isinstance(resp, httpx.Response) or resp.status_code != 200:
                     continue
+                soup = BeautifulSoup(resp.text, "lxml")
+                cards = soup.select("div[class*='_deal-card_']")
 
-                title_a = card.select_one("h3 a[href*='/d/'], a[href*='/d/']")
-                if not title_a:
-                    continue
-                deal_href = title_a.get("href", "")
-                if not deal_href or deal_href in seen_urls:
-                    continue
-                seen_urls.add(deal_href)
+                for card in cards[:15]:
+                    if card.select_one("[data-inactive='true']") is not None:
+                        continue
 
-                title = (
-                    title_a.get("aria-label")
-                    or title_a.get_text(" ", strip=True)
-                    or ""
-                ).strip()
-                if not title:
-                    continue
-                if spec and check_title(title, spec) is not None:
-                    continue
+                    title_a = card.select_one("h3 a[href*='/d/'], a[href*='/d/']")
+                    if not title_a:
+                        continue
+                    deal_href = title_a.get("href", "")
+                    if not deal_href or deal_href in seen_urls:
+                        continue
+                    seen_urls.add(deal_href)
 
-                ts_el = card.select_one("div[class*='timestamp']")
-                age_h = _parse_age_hours(ts_el.get_text(" ", strip=True) if ts_el else "")
-                # Strict freshness check: reject if timestamp is missing or older than max_age_hours (12h)
-                if age_h is None or age_h > max_age_hours:
-                    continue
+                    title = (
+                        title_a.get("aria-label")
+                        or title_a.get_text(" ", strip=True)
+                        or ""
+                    ).strip()
+                    if not title:
+                        continue
+                    if spec and check_title(title, spec) is not None:
+                        continue
 
-                stamp_el = card.select_one("span[class*='_deal-card-stamp_']")
-                price_val = parse_brl_price(
-                    stamp_el.get_text(" ", strip=True) if stamp_el else ""
-                )
-                if not price_val:
-                    continue
+                    ts_el = card.select_one("div[class*='timestamp']")
+                    age_h = _parse_age_hours(
+                        ts_el.get_text(" ", strip=True) if ts_el else ""
+                    )
+                    if age_h is None or age_h > max_age_hours:
+                        continue
 
-                store_a = card.select_one("div[class*='deal-card-store'] a")
-                raw_store = store_a.get_text(" ", strip=True) if store_a else "Pelando"
-                store_name, store_domain = _canonical_store(raw_store)
+                    stamp_el = card.select_one("span[class*='_deal-card-stamp_']")
+                    price_val = parse_brl_price(
+                        stamp_el.get_text(" ", strip=True) if stamp_el else ""
+                    )
+                    if not price_val:
+                        continue
 
-                full_deal_url = (
-                    f"https://www.pelando.com.br{deal_href}"
-                    if deal_href.startswith("/")
-                    else deal_href
-                )
+                    store_a = card.select_one("div[class*='deal-card-store'] a")
+                    raw_store = (
+                        store_a.get_text(" ", strip=True) if store_a else "Pelando"
+                    )
+                    store_name, store_domain = _canonical_store(raw_store)
+                    if (
+                        "shopee" in store_name.lower()
+                        and age_h > MAX_SHOPEE_FLASH_AGE_HOURS
+                    ):
+                        continue
 
-                candidates.append(
-                    {
-                        "store_name": store_name,
-                        "store_domain": store_domain,
-                        "product_title": title,
-                        "product_url": full_deal_url,
-                        "price_pix": price_val,
-                        "price_installment_total": price_val,
-                        "installments_count": 10 if price_val >= 200 else 6,
-                        "interest_free": True,
-                        "seller_name": f"{store_name} (Validado ao Vivo)",
-                        "seller_rating": 4.9,
-                        "is_official_store": True,
-                        "in_stock": True,
-                        "source": "Pelando (Confirmado)",
-                        "deal_age_hours": age_h,
-                        "deal_note": f"Postado há {int(max(1, age_h))}h e preço confirmado ao vivo na loja",
-                    }
-                )
+                    full_deal_url = (
+                        f"https://www.pelando.com.br{deal_href}"
+                        if deal_href.startswith("/")
+                        else deal_href
+                    )
+
+                    candidates.append(
+                        {
+                            "store_name": store_name,
+                            "store_domain": store_domain,
+                            "product_title": title,
+                            "product_url": full_deal_url,
+                            "price_pix": price_val,
+                            "price_installment_total": price_val,
+                            "installments_count": 10 if price_val >= 200 else 6,
+                            "interest_free": True,
+                            "seller_name": f"{store_name} (Validado Pelando)",
+                            "seller_rating": 4.9,
+                            "is_official_store": True,
+                            "in_stock": True,
+                            "source": "Pelando (Tempo Real)",
+                            "deal_age_hours": age_h,
+                            "deal_note": f"Oferta ativa postada há {int(max(1, age_h))}h no Pelando",
+                        }
+                    )
 
             verified_offers: list[dict[str, Any]] = []
             if candidates:
                 checked = await asyncio.gather(
-                    *[_verify_and_enrich_pelando_deal(client, c) for c in candidates[:5]],
+                    *[
+                        _verify_and_enrich_pelando_deal(client, c)
+                        for c in candidates[:6]
+                    ],
                     return_exceptions=True,
                 )
                 for res in checked:
@@ -272,15 +439,15 @@ async def hunt_pelando_live(
                         verified_offers.append(res)
 
             return verified_offers, ChannelStatus(
-                name="Pelando (<12h Confirmado)",
+                name="Pelando (Tempo Real)",
                 status="ok" if verified_offers else "vazio",
                 count=len(verified_offers),
-                detail=f"{len(verified_offers)} ofertas verificadas ao vivo",
+                detail=f"{len(verified_offers)} ofertas ativas verificadas",
             )
     except Exception as exc:
         logger.debug("Pelando hunt failed: %s", exc)
         return [], ChannelStatus(
-            name="Pelando (<12h Confirmado)",
+            name="Pelando (Tempo Real)",
             status="indisponivel",
             detail=str(exc)[:80],
         )
@@ -290,9 +457,9 @@ async def _verify_and_enrich_promobit_deal(
     client: httpx.AsyncClient, offer_id: Any, offer_url: str, item: dict[str, Any]
 ) -> dict[str, Any] | None:
     """
-    Verify a Promobit deal (<12h) by checking comments for expiration AND resolving
-    /Redirect/to/{offer_id}/ to the target retailer page to confirm the live store price
-    right now. If the live price cannot be confirmed on the store, reject the deal.
+    Verify a Promobit deal by checking comments for expiration AND resolving
+    /Redirect/to/{offer_id}/ to the target retailer page. For login-walled marketplaces
+    (Shopee / Mercado Livre), keep active deals (<24h-36h) with zero expiration comments.
     """
     try:
         d_resp = await client.get(offer_url, timeout=7.0)
@@ -318,6 +485,10 @@ async def _verify_and_enrich_promobit_deal(
                     if isinstance(c, dict)
                 ):
                     return None
+                instr = str(so.get("offerInstructionsRaw") or "").strip()
+                if instr:
+                    clean_instr = re.sub(r"\s+", " ", instr)[:140]
+                    item["deal_note"] = f"{item.get('deal_note', '')} • {clean_instr}".strip(" •")
 
         if not offer_id:
             return None
@@ -333,37 +504,59 @@ async def _verify_and_enrich_promobit_deal(
             return None
 
         out_url = m_link.group(1).strip()
-        store_resp = await client.get(out_url, timeout=8.0)
-        if store_resp.status_code != 200:
+        is_walled = _is_login_walled_marketplace(out_url) or _is_login_walled_marketplace(
+            item["store_name"]
+        )
+        age_h = float(item.get("deal_age_hours") or 0.0)
+        if "shopee" in item["store_name"].lower() and age_h > MAX_SHOPEE_FLASH_AGE_HOURS:
             return None
 
-        final_url = str(store_resp.url)
-        meta = extract_product_metadata(store_resp.text, final_url)
-        if meta.get("in_stock") is False:
-            return None
+        headers = (
+            {"User-Agent": "Twitterbot/1.0", "Accept-Language": "pt-BR,pt;q=0.9"}
+            if "mercadolivre.com.br" in out_url
+            else DEFAULT_HEADERS
+        )
+        try:
+            store_resp = await client.get(out_url, headers=headers, timeout=8.0)
+            if store_resp.status_code in (404, 410):
+                return None
+            if store_resp.status_code == 200:
+                final_url = str(store_resp.url)
+                meta = extract_product_metadata(store_resp.text, final_url)
+                if meta.get("in_stock") is False:
+                    return None
+                live_price = meta.get("price_brl")
+                if live_price and live_price > 0:
+                    posted_price = float(item["price_pix"])
+                    page_coupon: CouponInfo | None = item.get("page_coupon")
+                    if (
+                        page_coupon
+                        and live_price > posted_price
+                        and (live_price - posted_price) <= live_price * 0.25
+                    ):
+                        page_coupon.discount_value = round(live_price - posted_price, 2)
+                    elif live_price > posted_price * 1.18 and not page_coupon:
+                        return None
 
-        live_price = meta.get("price_brl")
-        if not live_price or live_price <= 0:
-            return None
+                    item["product_url"] = final_url
+                    item["price_pix"] = live_price
+                    item["price_installment_total"] = live_price
+                    s_name, s_dom = _canonical_store(final_url)
+                    if s_name != final_url and s_dom != "pelando.com.br":
+                        item["store_name"] = s_name
+                        item["store_domain"] = s_dom
+                        item["seller_name"] = f"{s_name} (Preço Confirmado ao Vivo)"
+                    return item
+        except Exception:
+            if not is_walled:
+                return None
 
-        posted_price = item["price_pix"]
-        page_coupon: CouponInfo | None = item.get("page_coupon")
-        if (
-            page_coupon
-            and live_price > posted_price
-            and (live_price - posted_price) <= live_price * 0.25
-        ):
-            page_coupon.discount_value = round(live_price - posted_price, 2)
+        if is_walled:
+            item["product_url"] = out_url
+            item["seller_name"] = f"{item['store_name']} (Oferta Ativa Promobit)"
+            return item
 
-        item["product_url"] = final_url
-        item["price_pix"] = live_price
-        item["price_installment_total"] = live_price
-        s_name, s_dom = _canonical_store(final_url)
-        if s_name != final_url:
-            item["store_name"] = s_name
-            item["store_domain"] = s_dom
-            item["seller_name"] = f"{s_name} (Preço Confirmado ao Vivo)"
-        return item
+        return None
     except Exception:
         return None
 
@@ -374,11 +567,13 @@ async def hunt_promobit_live(
     max_age_hours: float = MAX_COMMUNITY_AGE_HOURS,
 ) -> tuple[list[dict[str, Any]], list[CouponInfo], ChannelStatus]:
     """
-    Query Promobit's JSON API and keep ONLY offers from the last 12 hours whose
-    price is verified live on the target retailer page right now.
+    Query Promobit's JSON API using concise multi-query expansion and keep ONLY
+    recent verified deals (blocking 4-5 day old expired posts while capturing today's
+    Shopee, Mercado Livre, and Amazon promotions).
     """
     offers: list[dict[str, Any]] = []
     coupons: list[CouponInfo] = []
+    queries = _build_community_queries(query)
     headers = {
         **DEFAULT_HEADERS,
         "Origin": "https://www.promobit.com.br",
@@ -388,112 +583,127 @@ async def hunt_promobit_live(
         async with httpx.AsyncClient(
             headers=headers, follow_redirects=True, timeout=10.0
         ) as client:
-            resp = await client.get(
-                "https://api.promobit.com.br/search", params={"q": query.strip()}
+            resps = await asyncio.gather(
+                *[
+                    client.get(
+                        "https://api.promobit.com.br/search", params={"q": q}
+                    )
+                    for q in queries
+                ],
+                return_exceptions=True,
             )
-            if resp.status_code != 200:
-                return (
-                    [],
-                    [],
-                    ChannelStatus(
-                        name="Promobit (<12h Confirmado)",
-                        status="indisponivel",
-                        detail=f"HTTP {resp.status_code}",
-                    ),
-                )
 
-            data = resp.json()
-            active_offers = data.get("active_offers") or []
             now = datetime.now(timezone.utc)
             candidates: list[tuple[Any, str, dict[str, Any]]] = []
+            seen_ids: set[Any] = set()
 
-            for ao in active_offers[:10]:
-                if not isinstance(ao, dict):
+            for resp in resps:
+                if not isinstance(resp, httpx.Response) or resp.status_code != 200:
                     continue
-                if ao.get("offer_status_name") != "APPROVED":
-                    continue
+                data = resp.json()
+                active_offers = data.get("active_offers") or []
 
-                # Strict freshness filter: MUST have offer_published within the last max_age_hours (12h)
-                pub = ao.get("offer_published")
-                if not pub:
-                    continue
-                try:
-                    dt = datetime.fromisoformat(str(pub))
-                    age_h = round(
-                        (now - dt.astimezone(timezone.utc)).total_seconds() / 3600.0, 1
+                for ao in active_offers[:10]:
+                    if not isinstance(ao, dict):
+                        continue
+                    oid = ao.get("offer_id")
+                    if oid in seen_ids:
+                        continue
+                    seen_ids.add(oid)
+                    if ao.get("offer_status_name") != "APPROVED":
+                        continue
+
+                    pub = ao.get("offer_published")
+                    if not pub:
+                        continue
+                    try:
+                        dt = datetime.fromisoformat(str(pub))
+                        age_h = round(
+                            (now - dt.astimezone(timezone.utc)).total_seconds()
+                            / 3600.0,
+                            1,
+                        )
+                    except Exception:
+                        continue
+
+                    if age_h < 0 or age_h > max_age_hours:
+                        continue
+
+                    title = str(ao.get("offer_title") or "").strip()
+                    if not title:
+                        continue
+                    if spec and check_title(title, spec) is not None:
+                        continue
+
+                    price_val = parse_brl_price(ao.get("offer_price"))
+                    if not price_val:
+                        continue
+
+                    raw_store = str(
+                        ao.get("store_name") or ao.get("store_domain") or "Promobit"
                     )
-                except Exception:
-                    continue
+                    store_name, store_domain = _canonical_store(raw_store)
+                    if (
+                        "shopee" in store_name.lower()
+                        and age_h > MAX_SHOPEE_FLASH_AGE_HOURS
+                    ):
+                        continue
 
-                # Reject 1-day-old / 5-day-old stale offers immediately!
-                if age_h < 0 or age_h > max_age_hours:
-                    continue
-
-                title = str(ao.get("offer_title") or "").strip()
-                if not title:
-                    continue
-                if spec and check_title(title, spec) is not None:
-                    continue
-
-                price_val = parse_brl_price(ao.get("offer_price"))
-                if not price_val:
-                    continue
-
-                raw_store = str(
-                    ao.get("store_name") or ao.get("store_domain") or "Promobit"
-                )
-                store_name, store_domain = _canonical_store(raw_store)
-                slug = str(ao.get("offer_slug") or "").strip()
-                offer_url = (
-                    f"https://www.promobit.com.br/oferta/{slug}/"
-                    if slug
-                    else "https://www.promobit.com.br"
-                )
-
-                coupon_code = str(ao.get("offer_coupon") or "").strip().upper()
-                page_coupon: CouponInfo | None = None
-                if coupon_code and len(coupon_code) >= 3:
-                    page_coupon = CouponInfo(
-                        code=coupon_code,
-                        store_name=store_name,
-                        discount_type="fixed",
-                        discount_value=0.0,
-                        status="CONFIRMADO_HOJE",
-                        rule_description=f"Cupom postado há {age_h}h no Promobit ({title[:55]})",
-                        source="Promobit (<12h Confirmado)",
+                    slug = str(ao.get("offer_slug") or "").strip()
+                    offer_url = (
+                        f"https://www.promobit.com.br/oferta/{slug}/"
+                        if slug
+                        else "https://www.promobit.com.br"
                     )
 
-                candidates.append(
-                    (
-                        ao.get("offer_id"),
-                        offer_url,
-                        {
-                            "store_name": store_name,
-                            "store_domain": store_domain,
-                            "product_title": title,
-                            "product_url": offer_url,
-                            "price_pix": price_val,
-                            "price_installment_total": price_val,
-                            "installments_count": 10 if price_val >= 200 else 6,
-                            "interest_free": True,
-                            "seller_name": f"{store_name} (Confirmado ao Vivo)",
-                            "seller_rating": 4.9,
-                            "is_official_store": True,
-                            "in_stock": True,
-                            "source": "Promobit (<12h Confirmado)",
-                            "deal_age_hours": age_h,
-                            "deal_note": f"Postado há {age_h}h e preço confirmado ao vivo na loja",
-                            "embedded_coupon_code": coupon_code,
-                            "page_coupon": page_coupon,
-                        },
+                    coupon_code = str(ao.get("offer_coupon") or "").strip().upper()
+                    page_coupon: CouponInfo | None = None
+                    if (
+                        coupon_code
+                        and len(coupon_code) >= 3
+                        and " " not in coupon_code
+                    ):
+                        page_coupon = CouponInfo(
+                            code=coupon_code,
+                            store_name=store_name,
+                            discount_type="fixed",
+                            discount_value=0.0,
+                            status="CONFIRMADO_HOJE",
+                            rule_description=f"Cupom postado há {age_h}h no Promobit ({title[:55]})",
+                            source="Promobit (Ativo Hoje)",
+                        )
+
+                    candidates.append(
+                        (
+                            oid,
+                            offer_url,
+                            {
+                                "store_name": store_name,
+                                "store_domain": store_domain,
+                                "product_title": title,
+                                "product_url": offer_url,
+                                "price_pix": price_val,
+                                "price_installment_total": price_val,
+                                "installments_count": 10 if price_val >= 200 else 6,
+                                "interest_free": True,
+                                "seller_name": f"{store_name} (Validado Promobit)",
+                                "seller_rating": 4.9,
+                                "is_official_store": True,
+                                "in_stock": True,
+                                "source": "Promobit (Ativas)",
+                                "deal_age_hours": age_h,
+                                "deal_note": f"Oferta ativa postada há {age_h}h no Promobit",
+                                "embedded_coupon_code": coupon_code if page_coupon else "",
+                                "page_coupon": page_coupon,
+                            },
+                        )
                     )
-                )
 
             if candidates:
                 checked = await asyncio.gather(
                     *[
                         _verify_and_enrich_promobit_deal(client, oid, ourl, item)
-                        for oid, ourl, item in candidates[:5]
+                        for oid, ourl, item in candidates[:6]
                     ],
                     return_exceptions=True,
                 )
@@ -508,10 +718,10 @@ async def hunt_promobit_live(
                 offers,
                 coupons,
                 ChannelStatus(
-                    name="Promobit (<12h Confirmado)",
+                    name="Promobit (Ativas)",
                     status="ok" if offers else "vazio",
                     count=len(offers),
-                    detail=f"{len(offers)} ofertas verificadas ao vivo (<12h)",
+                    detail=f"{len(offers)} ofertas ativas verificadas",
                 ),
             )
     except Exception as exc:
@@ -520,10 +730,109 @@ async def hunt_promobit_live(
             [],
             [],
             ChannelStatus(
-                name="Promobit (<12h Confirmado)",
+                name="Promobit (Ativas)",
                 status="indisponivel",
                 detail=str(exc)[:80],
             ),
+        )
+
+
+async def hunt_mercadolivre_direct(
+    query: str,
+    spec: SpecContract | None = None,
+) -> tuple[list[dict[str, Any]], ChannelStatus]:
+    """
+    Discover Mercado Livre /p/MLB... catalog pages via Yahoo BR SERP and extract live
+    prices and native 'R$ X com Cupom' badges using Twitterbot SSR rendering.
+    """
+    from urllib.parse import unquote
+
+    queries = _build_community_queries(query)
+    search_q = f"site:mercadolivre.com.br {queries[0]}"
+    offers: list[dict[str, Any]] = []
+    try:
+        async with httpx.AsyncClient(
+            headers=DEFAULT_HEADERS, follow_redirects=True, timeout=10.0
+        ) as client:
+            resp = await client.get(
+                "https://br.search.yahoo.com/search", params={"p": search_q}
+            )
+            if resp.status_code != 200:
+                return [], ChannelStatus(
+                    name="Mercado Livre Catálogo", status="vazio", count=0
+                )
+
+            txt = unquote(resp.text)
+            raw_urls = list(
+                dict.fromkeys(
+                    re.findall(
+                        r"https?://(?:www\.|produto\.)?mercadolivre\.com\.br/[A-Za-z0-9_\-/]*MLB\d+[A-Za-z0-9_\-]*",
+                        txt,
+                    )
+                )
+            )
+            catalog_urls = [u for u in raw_urls if "/p/MLB" in u][:3]
+
+            for ml_url in catalog_urls:
+                try:
+                    ml_resp = await client.get(
+                        ml_url,
+                        headers={
+                            "User-Agent": "Twitterbot/1.0",
+                            "Accept-Language": "pt-BR,pt;q=0.9",
+                        },
+                        timeout=8.0,
+                    )
+                    if ml_resp.status_code != 200:
+                        continue
+                    meta = extract_product_metadata(ml_resp.text, ml_url)
+                    title = str(meta.get("title") or "").strip()
+                    price = meta.get("price_brl")
+                    if not title or not price or price <= 0:
+                        continue
+                    if spec and check_title(title, spec) is not None:
+                        continue
+
+                    native_coupon = _extract_ml_native_coupon(ml_resp.text, price)
+                    deal_note = (
+                        native_coupon.rule_description
+                        if native_coupon
+                        else "Catálogo Oficial Mercado Livre (Full)"
+                    )
+                    offers.append(
+                        {
+                            "store_name": "Mercado Livre",
+                            "store_domain": "mercadolivre.com.br",
+                            "product_title": title,
+                            "product_url": ml_url,
+                            "price_pix": price,
+                            "price_installment_total": price,
+                            "installments_count": 10 if price >= 200 else 6,
+                            "interest_free": True,
+                            "seller_name": "Mercado Livre (Catálogo Oficial)",
+                            "seller_rating": 4.9,
+                            "is_official_store": True,
+                            "in_stock": meta.get("in_stock") is not False,
+                            "source": "Mercado Livre Catálogo",
+                            "deal_note": deal_note,
+                            "page_coupon": native_coupon,
+                        }
+                    )
+                except Exception:
+                    continue
+
+            return offers, ChannelStatus(
+                name="Mercado Livre Catálogo",
+                status="ok" if offers else "vazio",
+                count=len(offers),
+                detail=f"{len(offers)} ofertas do catálogo ML",
+            )
+    except Exception as exc:
+        logger.debug("Mercado Livre direct hunt failed: %s", exc)
+        return [], ChannelStatus(
+            name="Mercado Livre Catálogo",
+            status="indisponivel",
+            detail=str(exc)[:80],
         )
 
 
