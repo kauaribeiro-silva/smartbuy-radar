@@ -32,22 +32,50 @@ DEAD_COUPON_MARKERS = (
 UNRELATED_NICHE_KEYWORDS = (
     "auto partes",
     "autopeças",
+    "veicpromo",
     "construção",
     "indústria",
     "snacks",
     "supermercado",
     "fralda",
+    "baby",
+    "bebê",
     "beleza",
     "perfume",
+    "promosaude",
+    "cuidados e saúde",
     "moda",
     "vestuário",
     "calçado",
     "pneu",
     "ração",
     "pet ",
+    "pets",
+    "malaprime",
+    "para sua casa",
+    "casatech",
+    "casaninja",
     "gta vi",
     "vemgta",
 )
+
+
+def _is_stale_dated_coupon(code: str) -> bool:
+    """
+    Detect single-day promotional coupons with embedded DDMM dates (e.g. CUP0N0M1A1111PB
+    for 11/11, CUP0N0M1A2810PB for 28/10, CUP0N0M1A1010PB for 10/10, CUP0N0M1A2309PB for 23/09).
+    If a valid DDMM date pattern is embedded and does not match today's DDMM, reject it.
+    """
+    today_ddmm = datetime.now().strftime("%d%m")
+    for m in re.finditer(r"(\d{4})", code):
+        digits = m.group(1)
+        if digits in ("1000", "2000", "2024", "2025", "2026", today_ddmm):
+            continue
+        dd = int(digits[:2])
+        mm = int(digits[2:])
+        if 1 <= dd <= 31 and 1 <= mm <= 12:
+            return True
+    return False
 
 CUPONOMIA_SLUGS: dict[str, str] = {
     "Mercado Livre": "mercado-livre",
@@ -82,11 +110,22 @@ async def _scrape_cuponomia_store(
                 return coupons
             soup = BeautifulSoup(resp.text, "lxml")
 
-            for li in soup.select("li.item-code, li.item-promo")[:10]:
+            scored_coupons: list[tuple[int, CouponInfo]] = []
+            prod_tokens = [
+                t for t in re.split(r"[^a-z0-9]+", prod_lower) if len(t) >= 4
+            ]
+
+            for li in soup.select("li.item-code, li.item-promo")[:14]:
+                li_text_lower = li.get_text(" ", strip=True).lower()
+                if "verificado" not in li_text_lower:
+                    continue
+
                 code_el = li.select_one(".item-code-link span, .coupon-code, button span")
                 raw_code = code_el.get_text(strip=True) if code_el else ""
                 code = re.sub(r"^Ver\s*Cupom\s*", "", raw_code, flags=re.IGNORECASE).strip().upper()
                 if not code or len(code) < 4 or " " in code or "ATIVE" in code or "ATIVAR" in code:
+                    continue
+                if _is_stale_dated_coupon(code):
                     continue
 
                 title_el = li.select_one("h3, .item-title")
@@ -95,10 +134,11 @@ async def _scrape_cuponomia_store(
                 desc_txt = desc_el.get_text(" ", strip=True) if desc_el else ""
                 combined = f"{title_txt} — {desc_txt}".strip(" —")
                 comb_lower = combined.lower()
+                full_check = f"{code.lower()} {comb_lower}"
 
-                if any(m in comb_lower for m in DEAD_COUPON_MARKERS):
+                if any(m in full_check for m in DEAD_COUPON_MARKERS):
                     continue
-                if any(k in comb_lower for k in UNRELATED_NICHE_KEYWORDS):
+                if any(k in full_check for k in UNRELATED_NICHE_KEYWORDS):
                     continue
                 # Brand-specific coupon check (e.g. ACERNOKABUM or JBL30OFF when product is AOC)
                 specific_brands = (
@@ -106,7 +146,7 @@ async def _scrape_cuponomia_store(
                     "lg", "philips", "apple", "motorola", "xiaomi", "playstation", "nintendo",
                 )
                 if any(
-                    b in f"{code.lower()} {comb_lower}" and b not in prod_lower
+                    b in full_check and b not in prod_lower
                     for b in specific_brands
                 ):
                     continue
@@ -115,9 +155,10 @@ async def _scrape_cuponomia_store(
                 category_specific_words = (
                     "impressora", "ar-condicionado", "geladeira", "fogão", "lavadora",
                     "colchão", "cadeira", "mochila", "mala", "ventilador", "air fryer",
+                    "monitor", "notebook", "smartphone", "celular", "console", "placa de vídeo",
                 )
                 if any(
-                    w in f"{code.lower()} {comb_lower}" and w not in prod_lower
+                    w in full_check and w not in prod_lower
                     for w in category_specific_words
                 ):
                     continue
@@ -142,20 +183,27 @@ async def _scrape_cuponomia_store(
                     continue
 
                 max_disc = float(max_match.group(1)) if max_match else None
+                relevance = sum(25 for tok in prod_tokens if tok in full_check)
 
-                coupons.append(
-                    CouponInfo(
-                        code=code,
-                        store_name=store_name,
-                        discount_type=dtype,  # type: ignore[arg-type]
-                        discount_value=dval,
-                        max_discount_brl=max_disc,
-                        min_spend_brl=min_spend,
-                        status="TESTAR_NO_CHECKOUT",
-                        rule_description=combined[:160],
-                        source="Cuponomia (Verificado hoje)",
+                scored_coupons.append(
+                    (
+                        relevance,
+                        CouponInfo(
+                            code=code,
+                            store_name=store_name,
+                            discount_type=dtype,  # type: ignore[arg-type]
+                            discount_value=dval,
+                            max_discount_brl=max_disc,
+                            min_spend_brl=min_spend,
+                            status="TESTAR_NO_CHECKOUT",
+                            rule_description=combined[:160],
+                            source="Cuponomia (Verificado hoje)",
+                        ),
                     )
                 )
+
+            scored_coupons.sort(key=lambda pair: pair[0], reverse=True)
+            coupons = [c for _, c in scored_coupons]
     except Exception as exc:
         logger.debug("Cuponomia scrape skipped for %s: %s", store_name, exc)
 

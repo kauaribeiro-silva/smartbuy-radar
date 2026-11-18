@@ -1,5 +1,5 @@
 from app.models import BenefitOption, CouponInfo, IdentifiedProduct, StoreOffer
-from app.pipelines.coupon_hunter import compute_coupon_discount
+from app.pipelines.coupon_hunter import _is_stale_dated_coupon, compute_coupon_discount
 from app.pipelines.financial_engine import compute_financial_verdicts
 from app.pipelines.recommendations import compute_timing_verdict
 from app.pipelines.spec_validator import (
@@ -267,4 +267,14 @@ def test_timing_verdict_levels():
     v_red = compute_timing_verdict([offer], [{"price_pix": 1350.0}], lowest_seen_db=1350.0)
     assert v_red.level == "red"
     assert v_red.watch_suggested is True
+
+
+def test_stale_dated_coupon_rejection():
+    assert _is_stale_dated_coupon("CUP0N0M1A1111PB") is True
+    assert _is_stale_dated_coupon("CUP0N0M1A2810PB") is True
+    assert _is_stale_dated_coupon("CUP0N0M1A1010PB") is True
+    assert _is_stale_dated_coupon("CUP0N0M1A2309PB") is True
+    assert _is_stale_dated_coupon("TELANINJA10") is False
+    assert _is_stale_dated_coupon("CORREHOJEPROML") is False
+
 
